@@ -1,0 +1,92 @@
+# The weekly TDCC 集保戶股權分散 collector (千張大戶 share).
+#
+# TDCC publishes ONE stock per POST behind a one-time form token, so the whole
+# market costs ~2 requests per symbol — ~30 minutes once a week, which is why
+# this is a separate job: the daily ETL joins the stored object and never
+# scrapes the portal itself. A run under 50 % coverage keeps the previous
+# object (a throttled scrape must not erase a complete one).
+#
+# Required repository secrets: R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY /
+# R2_ENDPOINT (the same three the daily ETL uses).
+
+name: Screener holdings (weekly)
+
+on:
+  schedule:
+    # Friday 13:00Z = 21:00 Taipei (UTC+8, no DST) — TDCC publishes the week's
+    # table on Friday evening. Explicit UTC, never a `timezone:` key: the
+    # daily ETL's crons proved that key is not applied to the registered
+    # schedule (the 2026-11-03 runs landed on the UTC walls), and a collector
+    # that silently fires eight hours early must never ship again.
+    - cron: '0 13 * * 5'
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: Comma-separated smoke list (empty = the whole universe)
+        type: string
+        default: ""
+
+concurrency:
+  group: screener-holdings
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  holdings:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: screener
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Trigger
+        run: |
+          echo "event=${{ github.event_name }} schedule='${{ github.event.schedule }}'"
+          date -u '+started %Y-%m-%dT%H:%M:%SZ (UTC)'
+          TZ=Asia/Taipei date '+started %Y-%m-%d %H:%M:%S (Taipei)'
+
+      - name: Check the R2 secrets
+        run: |
+          for k in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT; do
+            if [ -z "${!k}" ]; then
+              echo "::error::repository secret $k is missing — the collector cannot read or upload R2"
+              exit 1
+            fi
+          done
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+
+      - name: Install dependencies
+        run: >-
+          pnpm install --frozen-lockfile --ignore-scripts
+          --filter '@odf/screener-worker...' --filter '.'
+
+      - name: Typecheck
+        run: pnpm --filter '@odf/screener-worker' run typecheck
+
+      - name: Collect TDCC holdings
+        working-directory: apps/screener-worker
+        timeout-minutes: 50
+        run: |
+          if [ -n "${{ inputs.symbols }}" ]; then
+            bun holdings.ts --symbols "${{ inputs.symbols }}" --dry-run
+          else
+            bun holdings.ts
+          fi

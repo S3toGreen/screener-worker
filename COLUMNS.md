@@ -1,0 +1,184 @@
+# Screener columns — what is stored, from where, and why
+
+Universe: **上市 + 上櫃** STOCKS + FUNDS (ETF/ETN/REIT, `isScreenerSymbol`).
+Excluded BY SHAPE: warrants (TWSE `03`–`08` + 6 digits, TPEx `7xxxxx`), DRs
+(`91xxxx`), 特別股 (`2881A`/`2887Z1` — a suffix on a stock code) and indices;
+**興櫃 never appears** — the sources are the two mainboard tables, the ESB has
+its own endpoints, and the emerging-market list intersects the snapshot in zero
+symbols. The ETL additionally intersects each market with its listing universe
+for stocks and logs the census each run (`[etl] TWSE universe: … rows (… ETF/ETN/REIT) —
+rejected … shapes, … unlisted`). A fund has no company record, so
+`marketCap`/`turnoverRate` are null for it (the daily tables carry no share
+count) — and since an active 基本面 rule fails a row with no value, a
+fundamental screen culls funds naturally.
+
+Scope: the primitive (per-session stored) columns of the history contract
+(`packages/shared/src/screener.ts` `SCREENER_HISTORY_FIELDS`, 31 arrays + `dates`,
+retaining up to `SCREENER_HISTORY_SESSIONS` = 780 sessions), and how each
+reaches the row snapshot (`SCREENER_FIELDS`, 73 columns). Everything DERIVED in the
+snapshot (medians, streaks, returns, volatility) is computed in `src/etl.ts`
+from these primitives — those never need backfilling.
+
+Layering: `history/{symbol}.json` (primitives, per session) → the ETL derives
+the rolling snapshot columns from them → the client renders. A backfill must
+produce the primitives only.
+
+**No third-party data vendor is used.** Every column below has an official
+route on the exchanges' own per-date/per-period tables; the backfill needs
+~40 MOPS requests plus the per-session day walk (see §B).
+
+## A. History primitives by source
+
+**Daily ETL** = what the daily GitHub job appends: the exchanges' own
+per-date `rwd` tables for the anchor session (the source of record), with the
+OpenAPI "latest" mirror only as a DATED fallback — the mirrors regenerate
+~05:20 Taipei the NEXT morning, so an evening run can never anchor on them.
+**Backfill** = the same per-date routes, one session at a time. (An 18:45 run
+must not trust a mirror: measured 2026-11-05 02:00, TWSE `STOCK_DAY_ALL` still
+held T−1 while `MI_INDEX?date=T` answered.)
+
+| Column (history) | Daily ETL | Backfill / per-date |
+|---|---|---|
+| open, high, low, close, volume, tickets, tradeValue | TWSE `/rwd/zh/afterTrading/MI_INDEX?date=YYYYMMDD&type=ALLBUT0999` · TPEx `/www/zh-tw/afterTrading/otc?date=YYYY/MM/DD&type=EW` (the anchor comes from walking these tables; a NO-TRADE name is missing from them and is restored from the same-session mirror) | the same two routes (the `otc` endpoint strips the warrant board — ~1 000 rows vs dailyQuotes' ~13 000) |
+| turnoverRate | derived at write: `volume ÷ (paidIn ÷ par) × 100` | same formula (TWSE from the listing capital, TPEx from the per-date 發行股數) |
+| foreign, trust, dealer (NT$ net flow) | TWSE `/rwd/zh/fund/T86?date=` (the payload's own `stat` + `date` gate it) · TPEx `/www/zh-tw/insti/dailyTrade?date=&type=Daily&sect=EW`; the dated OpenAPI mirror only when it holds the anchor (blank/`X` cells are NULL, never 0) | the same two per-date routes |
+| marginBal, marginQuota, shortBal, marginBuy/Sell/CashRepay, shortSell/Cover/CashRepay, marginOffset, marginNote (TWSE) | `/rwd/zh/marginTrading/MI_MARGN?date=&selectType=ALL` — ONE request; its table 0 is the market summary and its per-stock block (positionally 2–6 margin, 8–12 short, 13 券限額 (≡ 資限額), 14 資券互抵 → `marginOffset`, 15 註記 → `marginNote`) is read from the SAME response. The title carries the session. The undated OpenAPI margin mirror is NOT used — it once stamped yesterday's balances on the anchor | the same per-date table. NOTE the per-date table's `次一營業日限額` (position 7) is NOT the same day's 融資限額 — a difference documented since the first backfill |
+| marginBal, marginQuota, shortBal, marginBuy/Sell/CashRepay, shortSell/Cover/CashRepay, marginOffset, marginNote (TPEx) | `/www/zh-tw/margin/balance?date=YYYY/MM/DD` (positional 0 代號, 2 前資, 3 資買, 4 資賣, 5 現償, 6 資餘額, 9 資限額, 10 前券, 11 券賣, 12 券買, 13 券償, 14 券餘額, 17 券限額, 18 資券相抵 → `marginOffset`, 19 備註 → `marginNote`); the OpenAPI `tpex_mainboard_margin_balance` (own `Date`, `Offsetting`/`Note` mapped) is the fallback only when it holds the anchor | the same per-date table (answers back to at least **2007/01** — verified). ALL rows are kept (ETFs included) — the market-wide OTC totals are summed from this map; the seeds still look up stocks only |
+| per, pbr, divYield | TWSE `/rwd/zh/afterTrading/BWIBBU_d?date=&selectType=ALL` (**`ALL`, not `ALLBUT0999`**) · TPEx `/www/zh-tw/afterTrading/peQryDate?date=YYYY/MM/DD`; the OpenAPI mirrors (`BWIBBU_ALL` / `tpex_mainboard_peratio_analysis`) only when they date to the anchor | the same two per-date routes — STOCKS ONLY: neither table lists ETFs/ETNs, so a fund row's valuation cells stay null (as do its cap/turnover/margins/revenue) |
+| grossMargin, opMargin, pretaxMargin, netMargin | TWSE `t187ap17_L` · TPEx `mopsfin_187ap17_O` (an `出表日期` skewed >30 d from the anchor is rejected as a frozen feed) | **MOPS** `POST /mops/web/ajax_t163sb06` (`TYPEK=sii\|otc`, `year={民國}`, `season=01..04`) — one market-wide table per quarter |
+| revenueMom, revenueYoy | TWSE `t187ap05_L` · TPEx `mopsfin_t187ap05_O` (the payload's 資料年月 must be the anchor's month or the previous one) | **MOPS archive** `GET /nas/t21/{sii\|otc}/t21sc03_{ROC year}_{month}_{0\|1}.html` — Big5, one table per industry, `_1` = the KY (國外) file |
+| foreignShares, foreignRatio (外資持股) | TWSE `/rwd/zh/fund/MI_QFIIS?date=&selectType=ALLBUT0999` · TPEx `/www/zh-tw/insti/qfii?date=` (the per-date report IS the daily source — no OpenAPI mirror exists) | the same two routes |
+| sblBal (借券賣出餘額, DISTINCT from 融券) | TWSE `/rwd/zh/marginTrading/TWT93U?date=YYYYMMDD` (信用額度總量管制餘額表, units 股; block B is 借券賣出, `當日餘額` = positional col 12; answers back to at least 2007) · TPEx `/www/zh-tw/margin/sbl?date=` col 12 (`當日餘額` of the 借券 block; the dated OpenAPI `tpex_margin_sbl` is the fallback) | the same two per-date tables. The old undated TWSE `SBL/TWT96U` (可借券賣出股數, a DIFFERENT quantity) is no longer used; TWSE rows before 2026-11-05 in the retained history still hold that old metric until a `backfill --months N` re-run rewrites them |
+| dayTradeShares (當沖) | TWSE `exchangeReport/TWTB4U` — `tables[1]` per stock, `當日沖銷交易成交股數` (the payload's own `date` gates it; the endpoint serves the LATEST session on a holiday) · TPEx `www/zh-tw/intraday/stat?type=Daily` — the same per-stock columns in `tables[1]` (an empty table is the holiday answer). **A symbol absent from a COMPLETE table is a real `0`** (the per-stock rows sum to `tables[0]`'s market total exactly; a payload that does not add up is treated as absent, never as zeros) | the same two routes per date |
+| bigHolderPct (千張大戶) | **TDCC weekly** `POST /portal/zh/smWeb/qryStock` (`scaDate` = the newest week, `stockNo`) — the `1,000,001 股以上` bracket's share of the 集保 balance; ONE stock per one-time form token, so a separate weekly job (~2 requests/symbol) writes `holdings.json` | the same portal, week by week (not part of the day walk) |
+| riskFlags | TWSE/TPEx risk lists (停資停券/暫停交易/處置/全額交割, OR-ed bitmask) | **daily accrual only** — the lists are point-in-time, no per-date variant |
+
+Residual gaps (deliberate, never fabricated): `riskFlags` history is null before
+the accrual date (the lists are point-in-time); TWSE `sblBal` rows BEFORE the
+`TWT93U` cutover (2026-11-05) hold the old 可借券賣出股數 metric until a
+`backfill` re-run rewrites the retained window; `bigHolderPct` is the weekly
+TDCC value (null until the first weekly run, at most 7 days old by
+construction) and `bigHolder4w` stays null until the object holds FIVE weeks.
+
+## B. The MOPS routes (the only non-exchange hosts)
+
+Both are market-wide reports, so a 3-year backfill is ~40 requests instead of
+~2 000 per-symbol crawls:
+
+- **Quarterly 三率** — `POST https://mopsov.twse.com.tw/mops/web/ajax_t163sb06`
+  with the site's own form body (`encodeURIComponent=1&step=1&firstin=ture&off=1&isQuery=Y&TYPEK=sii|otc&year=115&season=02`).
+  Publish days (verbatim from the report note): Q1 May 16 · Q2 Aug 15 · Q3
+  Nov 15 · annual Apr 1 of the FOLLOWING year. Row: 公司代號 · 名稱 ·
+  營業收入(百萬) · 毛利率 · 營業利益率 · 稅前純益率 · 稅後純益率; the trailing
+  合計 row carries one cell and is filtered by `isStockSymbol`. Financial
+  industries are absent by design.
+- **Monthly revenue** — `GET https://mopsov.twse.com.tw/nas/t21/{sii|otc}/t21sc03_{ROC year}_{month}_{0|1}.html`,
+  published from the 10th of the following month. The month is **UNPADDED**
+  (`_9_0`, `_1_1`; `_09_` is a 404); the page is **Big5**; one nested table per
+  industry; cells may use an upper-case `<Td>` tag (the scan is
+  case-insensitive). Row: 代號 · 名稱 · 當月 · 上月 · 去年當月 · **MoM%** ·
+  **YoY%** · 當月累計 · 去年累計 · 前期% · 備註 — the values are read from the
+  report, never recomputed. A month not yet published is an empty shell page
+  (0 rows), which is why the collector gates on the publish DAY.
+
+Both parsers assert a minimum row count (`expectRows`), so a layout drift
+fails the backfill loudly instead of null-filling the history.
+
+## C. Snapshot columns derived from the primitives (never backfilled)
+
+| Snapshot column | Derivation (src/etl.ts) |
+|---|---|
+| sessions | `min(len, 20)` |
+| avgTradeValue5 / avgTradeValue20 | median of the newest ≤5 / ≤20 `tradeValue` |
+| avgTradeTickets20 | median of the newest ≤20 `tickets` |
+| marketCap | `(paidIn ÷ par) × close ÷ 100` |
+| deltaRatio | `(foreign + trust + dealer) ÷ tradeValue × 100` |
+| instForeign5/instTrust5/instDealer5/instTotal5 | sums over the newest ≤5 sessions with published flow |
+| instTrustStreak | consecutive trust-net-buy sessions |
+| volatility20 | population stdev of the newest ≤20 daily % changes (null < 6 pairs) |
+| distFrom20dHigh | `(max20 − last) ÷ max20 × 100` (null < 6 sessions) |
+| volRatio5 | `tradeValue ÷ avgTradeValue5` |
+| ret1d/5d/20d/60d/240d | `close_now ÷ close_N sessions ago − 1` over the history closes |
+| foreignRatio (snapshot) | the session's 外資持股 %, straight from `foreignShares/foreignRatio` |
+| dayTradeRatio | `dayTradeShares ÷ volume × 100` — both exchanges; a `0` is a real "traded but no 當沖" (the per-stock rows sum to the market total), a `null` is an absent report |
+| bigHolderPct / retailPct / holderCount / bigHolder4w | the weekly TDCC series (`holdings.json`, up to 156 weeks = 3 years — the same horizon as the session history): the `1,000,001 股以上` share, the `≤ 50 張` share, the 合計 戶數, and the 大戶 share's Δ over 4 weeks |
+| exDivInDays | the accumulated ex-dividend calendar (`dividends.json`, TWSE `TWT48U` — the exchange serves only today's 3-week window, so the ETL folds each run in and prunes) |
+| revenueCumYoy | the MOPS/TWSE revenue report's 前期比較增減 (cumulative YoY) |
+| revenueTtm | Σ the trailing 12 DISTINCT `revenueMonth` values (deduped by `revenueYm`), NT$ thousands |
+| listedDate | 上市日期 from the listing universe (`t187ap03_L` / `mopsfin_t187ap03_O`), a `YYYYMMDD` string |
+| benchmark (TAIEX pill) | `FMTQIK` monthly index closes, same horizons |
+| marginChange / shortChange | the published 今日餘額 − 前日餘額 (both official cells), in the exchange's 交易單位 |
+| avgMarginCost | the ROLLING estimate (`@odf/shared/credit` `rollAverageMarginCost`), persisted in `credit-state.json` (v2): `(remaining_prev × priorCost + buy × close) ÷ balance` where `remaining_prev = prevBalance − cashRepay − sell`; a cold start seeds from the trailing 60-session VWAP (`vwapOf`), and a session whose book had to initialize at the CLOSE (or reset on a ≥50 % corporate-action jump) publishes null — the constant 100/0.6 is not an estimate |
+| estMaintenanceRatio | `close ÷ (avgMarginCost × 0.60) × 100` — a STOCK-LEVEL risk estimate, never a brokerage 整戶擔保維持率. The two estimates are the only CALCULATED credit cells: the exchanges publish per-stock LOTS only (no per-security 融資金額), so a per-stock cost basis cannot be read from official data. |
+
+## D. The market context (`market-latest.json` → `/api/market`, latest only — no history)
+
+The market-wide context is a SEPARATE object with its own route and cache: the stock
+grid (`screener-latest.json` → `/api/snapshot`) carries per-stock rows and the TAIEX
+benchmark ONLY. `MarketContext = { asOf, credit, derivatives }` (each half independently
+nullable); the ETL writes it before the snapshot and skips a byte-identical rewrite.
+
+Two latest-only sections make up the object (the ETL reads them after the
+equity sources; a failure logs and leaves its half null, it never degrades the
+grid):
+
+| Section | Source | Notes |
+|---|---|---|
+| `credit` (`MarketCredit`, 上市 + 上櫃) | TWSE `/rwd/zh/marginTrading/MI_MARGN?date=&selectType=ALL` — ONE response: table 0 (market lots + ALL FIVE 融資金額 columns) and table 1 (per-stock); the 上櫃 side sums the per-stock TPEx map's WHOLE MARKET (every security) for lots AND flows, plus `/www/dashboardOtc/margin?lang=zh-tw&date=` for its money summary (億元 → NT$; recent-only; it carries NO OTC-specific ratio — its `keepRate` is the exchange-wide number and is not read); `/rwd/zh/marginTrading/BFIJ3U_TREND?days=10&date=…` for TWSE's official ratio | **Two ratios, two definitions.** `maintenanceRatio` = Σ(both markets' `marginBal × close × 10`) ÷ (`TWSE 融資金額` + `TPEx 融資餘額`) × 100 — the 上市櫃融資維持率 ESTIMATE (financed value over the loan balance; more price-sensitive than the collateral ratio), with `scope` naming the markets both halves covered; no cost-basis variant is needed at market level (the announced loan is exact). `officialMaintenanceRatio` = TWSE's own 全市場擔保維持率 (`keepRate`, whole-account, structurally higher), same session only. `marginToMarketCap` = the loan balance ÷ Σ cap over the same scope. Per-stock tables carry LOTS only, so no per-stock loan amount/ratio exists. |
+| `derivatives` (`MarketDerivatives`) | TAIFEX OpenAPI: `MarketDataOfMajorInstitutionalTradersDividedByFuturesAndOptionsBytheDate` (futures/options per 三大法人), `…DetailsOfFuturesContractsBytheDate`, `…DetailsOfCallsAndPutsBytheDate` (TXO calls/puts), `OpenInterestOfLargeTradersFutures`/`…Options` (top 5/10 vs market OI), `PutCallRatio` (volume AND OI ratios, kept distinct), and the VIX daily-close file `file/taifex/Dailydownload/vix/log2data/YYYYMMnew.txt` (Big5, monthly) | Filtered to the index roster (TX/MTX/TMF/TE/TF/TXO) so the snapshot stays small. All are PUBLISHED AGGREGATES — not complete trader-level data. Some endpoints answer JSON, others CSV (even to `Accept: application/json`) and some CSV bodies carry a BOM — the shared `getRecords` picks by shape. Unavailable (documented, not invented): any per-investor position breakdown beyond these aggregates |
+
+TAIFEX publishes these AGGREGATED daily, after the RTH close — that is exactly
+what the market object consumes (there is no weekly aggregate: FINI, dealers and
+investment trust companies are one daily bulletin). Per-stock 融資金額 does not
+exist (the exchanges publish the amount only as the market aggregate), so no row
+carries a financing amount — the credit FILTER rules are normalized instead
+(融資使用率 = balance ÷ quota, 券資比 = short ÷ margin, and the stock-level
+maintenance estimate).
+
+The VIX is the only value with no OpenAPI route: the exchange publishes it as
+an HTML page plus the monthly file above; the file's rows are TAB-padded, so
+empty cells are dropped before indexing.
+
+## E. The reference objects and the desktop's consumption
+
+Two market-wide objects ride the same bucket and the same API (their own
+routes, same edge cache):
+
+| Object | Route | Shape | Consumer |
+|---|---|---|---|
+| `holdings.json` | `/api/holdings` | `{updatedAt, weeks:[{week, symbols:{sym:[big%, retail%, holders]}}]}` — newest first, ≤ 156 weeks (the client caches the newest 26) | the ETL's `bigHolderPct`/`retailPct`/`holderCount`/`bigHolder4w` columns AND the preview's weekly TDCC pane |
+| `dividends.json` | `/api/dividends` | `{updatedAt, events:[{symbol, exDate, cash, stockRatio, kind}]}` | the ETL's `exDivInDays` column AND the preview's next-cash-dividend row |
+
+The contract types + guards + route constants live in `@odf/shared/screener`
+(`HoldingsObject`/`isHoldingsObject`/`HoldingsPoint`/`holdingsSeriesOf`,
+`DividendsObject`/`isDividendsObject`/`dividendsOf`) — the worker's collector
+and the desktop read the SAME definitions. The client service caches both in
+localStorage (`odf-screener-holdings` / `odf-screener-dividends`, validated by
+the same guards, served from the cache when the CDN fails) and `PreviewCard`
+projects them per symbol; the per-session series (當沖 %, 外資持股 %, 累計營收
+年增, 融資使用率, 券資比) come from the history primitives instead
+(`PreviewSession`, index-aligned with the bundle's candles).
+
+## E. Failure discipline
+
+- A source that answers a FOREIGN session is treated as ABSENT (never stamped
+  under the anchor): valuation falls back to the per-date twin, ratios/revenue
+  are periodicity-checked, TPEx margin/sbl are date-gated.
+- Every degraded factor lands in `EtlResult.partial`; `seed.ts` retries once
+  with `--force`, then exits 3 and the workflow retries once more.
+- `force` bypasses BOTH freshness gates, and a forced same-session re-run
+  preserves any non-null cell the earlier pass published.
+- A corrupt `history/{symbol}.json` is quarantined (`.corrupt`) before the
+  history is rebuilt — never silently replaced with a one-session file.
+- A truncated daily table (< 900 TWSE / < 700 TPEx rows) carries the market's
+  previous rows instead of stamping a partial session — and the carry is a
+  `carried:<market>` partial token (the workflow retries, then fails).
+- The anchor is discovered by walking the exchanges' own per-date daily tables
+  from today backwards (`probeDays`, ≤5 weekdays, weekends skipped) — the
+  first date that answers IS the anchor. The OpenAPI mirrors are only date
+  hints / dated fallbacks (they regenerate ~05:20 Taipei the next morning), so
+  a real session is never skipped or mis-dated because a mirror lagged. The
+  walk is what lets the 03:45 guard repair the PREVIOUS session: the mirrors
+  at that hour are one to two sessions behind.
+- The published session never rewinds: an anchor older than the stored session
+  (a CDN flap) skips instead of replacing it, `force` included.

@@ -1,0 +1,26 @@
+{
+  "name": "@odf/screener-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler pages dev",
+    "deploy": "wrangler pages deploy public --branch main",
+    "cf-typegen": "wrangler types",
+    "typecheck": "tsc --noEmit -p tsconfig.worker.json && tsc --noEmit -p tsconfig.seed.json",
+    "seed": "bun --env-file=.dev.vars seed.ts",
+    "backfill": "bun --env-file=.dev.vars backfill.ts",
+    "holdings": "bun --env-file=.dev.vars holdings.ts",
+    "verify": "bun --env-file=.dev.vars verify.ts",
+    "smoke": "bun smoke.ts"
+  },
+  "dependencies": {
+    "@odf/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-s3": "^3.1156.0",
+    "@cloudflare/workers-types": "^5.20261019.1",
+    "@types/bun": "1.4.3",
+    "wrangler": "^4.151.2"
+  }
+}

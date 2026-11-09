@@ -1,0 +1,195 @@
+# The screener's daily data refresh (Mon–Fri, plus the 03:45 Taipei guard that
+# runs Tue–Sat). The slots below are the active trigger; an external dispatcher
+# (e.g. a Cloudflare cron Worker the operator owns) can instead POST
+# `workflow_dispatch` with `phase: early` on the evening runs and `force: true`
+# on the guard — the run itself is identical either way.
+#
+# Why GitHub Actions and not the Worker's own cron: the account is on the
+# Workers Free plan (50 subrequests / 10 ms CPU per invocation, and `limits` is
+# rejected there), while one ETL run makes ~4 000 R2 operations. The Pages
+# function stays a free read-only CDN; this job runs the SAME `runEtl` from
+# `apps/screener-worker/src/etl.ts`, reads the PREVIOUS objects straight from
+# R2 through the S3 API and pushes the new ones the same way (`seedFs.ts`).
+#
+# Required repository secrets:
+#   R2_ACCESS_KEY_ID     — an R2 API token's Access Key ID (Dashboard → R2 →
+#   R2_SECRET_ACCESS_KEY   Manage R2 API Tokens → Object Read & Write)
+#   R2_ENDPOINT          — https://<account id>.r2.cloudflarestorage.com
+#
+# A Worker can TRIGGER this workflow (one subrequest); it cannot RUN the ETL —
+# a Free invocation is 50 subrequests / 10 ms CPU.
+
+name: Screener ETL
+
+on:
+  schedule:
+    # 18:15 Taipei — the first publish. Most sources are out; BOTH exchanges'
+    # per-date margin tables and TPEx's SBL table publish later in the evening
+    # (measured: absent at 21:20 Taipei, present by the next morning), so this
+    # run is EXPECTED to be partial on those three. `seed.ts` defers them to
+    # the guard instead of burning a retry (KNOWN_LATE_SOURCES).
+    - cron: '15 10 * * 1-5'
+    # 21:15 Taipei — the second attempt (a failed/missed first run stores the
+    # session here). On a healthy evening the freshness gate skips it.
+    - cron: '15 13 * * 1-5'
+    # 03:45 Taipei, Tue–Sat — the GUARD. It runs FORCED: a late-published
+    # file must overwrite the session the evening stored (null never
+    # overwrites, so it only fills/corrects), and a session the evening never
+    # published still lands. On a complete evening it is a ZERO-WRITE no-op
+    # (byte-identical histories and grid are not rewritten).
+    - cron: '45 19 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rewrite the current session even if R2 already holds it
+        type: boolean
+        default: false
+      phase:
+        description: >-
+          early = a partial is only a warning (the catch-up is still scheduled).
+          Leave empty for a strict run (the default).
+        type: string
+        default: ''
+
+concurrency:
+  group: screener-etl
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  etl:
+    # Pinned: `ubuntu-latest` migrates to Ubuntu 26 (see the runner's own
+    # warning); a data job must not change base images behind our back.
+    runs-on: ubuntu-latest
+    # Room for the seed (≤20) + verify + installs; seed.ts owns its ONE forced
+    # retry internally (skipped when the run was already forced), so there is
+    # no second ETL step to budget for.
+    timeout-minutes: 30
+    # ONE place the R2 configuration lives: every step (seed, verify) inherits
+    # it, and the preflight below fails in the first second when a repository
+    # secret is missing — the 2026-10-30 run went green WITHOUT credentials
+    # only because the freshness gate skipped before touching R2.
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: screener
+    steps:
+      - uses: actions/checkout@v7
+
+      # The schedule is best-effort; this line is the ONE place the ACTUAL
+      # trigger (which cron, at what wall time) becomes visible, so a late or
+      # mis-timed run is diagnosable from the log alone.
+      - name: Trigger
+        run: |
+          echo "event=${{ github.event_name }} schedule='${{ github.event.schedule }}'"
+          date -u '+started %Y-%m-%dT%H:%M:%SZ (UTC)'
+          TZ=Asia/Taipei date '+started %Y-%m-%d %H:%M:%S (Taipei)'
+
+      - name: Check the R2 secrets
+        run: |
+          for k in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT; do
+            if [ -z "${!k}" ]; then
+              echo "::error::repository secret $k is missing — the ETL cannot read or upload R2"
+              exit 1
+            fi
+          done
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+
+      # Scoped to what the ETL runs: the worker + @odf/shared, plus the ROOT
+      # (its devDeps carry `tsc`, which the typecheck step runs). The desktop /
+      # mobile / server workspaces are never installed — a cold run downloads
+      # ~650 MB less (electron, duckdb, grpc) and their postinstalls cannot fail
+      # the data job (`--ignore-scripts` covers the rest).
+      - name: Install dependencies
+        run: >-
+          pnpm install --frozen-lockfile --ignore-scripts
+          --filter '@odf/screener-worker...' --filter '.'
+
+      # Bun strips types when it runs seed.ts, so a contract break in
+      # @odf/shared/screener would otherwise reach the upload instead of failing.
+      - name: Typecheck
+        run: pnpm --filter '@odf/screener-worker' run typecheck
+
+      # The pure-logic suites (contract widths/padding, the market sanitizer,
+      # the credit roll, the ETL's merge/freshness gates). They need only the
+      # installed workspaces, and a broken contract should fail HERE rather
+      # than after the R2 upload.
+      - name: Unit tests
+        run: bun test packages/shared/src apps/screener-worker/src
+
+      - name: Run the ETL and upload to R2
+        id: seed
+        working-directory: apps/screener-worker
+        timeout-minutes: 20
+        # seed.ts already retries a partial run ONCE with `--force` internally.
+        # The step itself must not go RED: a partial run still uploaded a
+        # complete snapshot, and the final gate decides the job's colour. The
+        # catch-up cron (and a dispatch with force) rewrites the same stamp.
+        run: |
+          set +e
+          force=''
+          # The 03:45 guard is ALWAYS a forced same-session rewrite (the
+          # dispatcher asks for it explicitly with `force: 'true'`).
+          if [ "${{ inputs.force }}" = 'true' ] || [ "${{ github.event.schedule }}" = '45 19 * * 1-5' ]; then
+            force='--force'
+          fi
+          echo "seed $force"
+          bun seed.ts $force
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # The public API is the deployment: a stale Pages function (it once
+      # predated the fund universe and 404'd every ETF history) or a missed
+      # upload must fail here, not on a user's grid.
+      - name: Verify the served data
+        # A PARTIAL run still published a complete grid — the API it serves
+        # must be verified too (code 3); only a storage failure (1) skips it.
+        if: steps.seed.outputs.code == '0' || steps.seed.outputs.code == '3'
+        working-directory: apps/screener-worker
+        timeout-minutes: 5
+        run: bun verify.ts
+
+      # exit 0 = complete. A PARTIAL (code 3) early attempt is expected — the
+      # TPEx margin/SBL tables roll over after 21:00 Taipei — so it is a
+      # warning; a slot with NO repair behind it (the 03:45 guard, a plain
+      # dispatch) fails the job. That keeps one honest red per day instead of a
+      # nightly red that hides real breakage.
+      - name: Fail unless the run was complete
+        if: always()
+        run: |
+          seed='${{ steps.seed.outputs.code }}'
+          sched='${{ github.event.schedule }}'
+          phase='${{ inputs.phase }}'
+          if [ "$seed" = '0' ]; then
+            echo 'ETL complete.'
+            exit 0
+          fi
+          # The expected late-TPEx partial is a warning ONLY where a later run
+          # still repairs it: an evening slot, or a dispatch tagged `early`.
+          # The 03:45 guard and a plain dispatch have no repair behind them —
+          # they fail.
+          early_schedule=''
+          case "$sched" in
+            '15 10 * * 1-5' | '15 13 * * 1-5') early_schedule=1 ;;
+          esac
+          if [ "$seed" = '3' ] && { [ "$phase" = 'early' ] || [ "$early_schedule" = '1' ]; }; then
+            echo "::warning::ETL partial (seed=3) — the 03:45 Taipei guard repairs the session"
+            exit 0
+          fi
+          echo "ETL FAILED: seed=${seed:-not-run} schedule=${sched:-none}" >&2
+          exit 1

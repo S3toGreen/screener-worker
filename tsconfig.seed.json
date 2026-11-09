@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ESNext"],
+    "types": ["bun"],
+    "strict": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "verbatimModuleSyntax": true,
+    // "noUncheckedIndexedAccess": true
+  },
+  "include": [
+    "seed.ts",
+    "seedFs.ts",
+    "backfill.ts",
+    "holdings.ts",
+    "smoke.ts",
+    "verify.ts",
+    "src/etl.test.ts",
+    "src/history.test.ts",
+    "worker-configuration.d.ts",
+  ]
+}

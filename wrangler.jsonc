@@ -1,0 +1,24 @@
+/**
+ * The screener's Pages project: the landing page in `public/`, the data API in
+ * `functions/api/` (R2-backed, edge-cached), served at
+ * https://odf-trading.pages.dev.
+ *
+ * The daily ETL does NOT run here: the account is on the Workers Free plan
+ * (50 subrequests / 10 ms CPU per invocation), while one run makes ~4 000 R2
+ * operations. It runs in GitHub Actions (`.github/workflows/screener-etl.yml`)
+ * through `seed.ts` and writes to the SAME bucket.
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "odf-trading",
+	"pages_build_output_dir": "public",
+	"compatibility_date": "2026-10-19",
+	"upload_source_maps": true,
+	// `screener-latest.json` + `history/{symbol}.json` — the ONLY storage.
+	"r2_buckets": [
+		{
+			"binding": "R2_BUCKET",
+			"bucket_name": "screener"
+		}
+	]
+}
