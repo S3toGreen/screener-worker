@@ -27,7 +27,7 @@ import {
   type HoldingsObject,
   type HoldingsRow,
   type HoldingsWeek
-} from '@odf/shared/screener'
+} from '@odf/screener-worker/screener'
 import type { ScreenerEnv } from './env'
 import { HOLDINGS_KEY } from './keys'
 

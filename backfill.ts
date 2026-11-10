@@ -1,36 +1,49 @@
 /**
  * History backfill (run once, before the daily schedule takes over) — a pure
- * rebuild from the EXCHANGES' official per-date/per-period tables. No third
- * party: every column below has an official route (TWSE/TPEx rwd per-date
- * tables, MOPS quarterly/monthly reports), so a 3-year rebuild needs ~40 MOPS
- * requests plus the per-session day walk — never a per-symbol vendor pull.
+ * rebuild from the EXCHANGES' official DAILY per-date tables (TWSE + TPEx).
+ * No third party, no MOPS monthly/quarterly scrape: a 3-year rebuild is the
+ * weekday day walk only.
  *
- *   pnpm --filter @odf/screener-worker run backfill -- --months 36 --dry-run
- *   pnpm --filter @odf/screener-worker run backfill -- --from 2023-10-01 --to 2026-10-22
- *   pnpm --filter @odf/screener-worker run backfill -- --months 1 --symbols 2330,6488 --dry-run
+ *   bun backfill.ts --months 36 --dry-run
+ *   bun backfill.ts --from 2023-10-01 --to 2026-10-22
+ *   bun backfill.ts --months 1 --symbols 2330,6488 --dry-run
  *
- * Flags: `--months N` (default 36) · `--from/--to YYYY-MM-DD` ·
- * `--symbols a,b,c` / `--sample N` (a SMOKE run: the write set is limited and
- * NOTHING is uploaded) · `--api <base>` (the snapshot to learn the universe
- * from, default the deployed Pages API) · `--dry-run` (never upload) ·
- * `--keep` (keep .seed-out/).
+ * Flags: `--months N` (default 36, the absolute horizon) · `--from/--to` ·
+ * `--symbols a,b,c` / `--sample N` (a SMOKE run: limited and NEVER uploaded) ·
+ * `--repair` (an explicit symbol set is uploadable) · `--histories-only`
+ * (upload histories + benchmark only, no snapshot) · `--gap-fill` (reverse
+ * walk, stop at the first stored date) · `--api <base>` · `--dry-run` ·
+ * `--keep`.
  *
  * Flow: universe (the live snapshot's market caps imply the share count) →
- * the MOPS collector (quarters + months, concurrently with the day walk, both
- * paced by the shared polite gate) → one exchange read per session → per-symbol
- * column arrays → settled-or-fail gate → histories → benchmark → the SAME
- * `runEtl` the daily job runs (history first, snapshot second) → upload.
+ * a REVERSE weekday walk over the exchanges' DAILY RWD tables only (TWSE +
+ * TPEx; no MOPS monthly/quarterly fetch) → per-symbol column arrays → merge
+ * with the stored histories → benchmark → (full mode) the SAME `runEtl` the
+ * daily job runs, history first.
+ *
+ * Each exchange and each report is an independent RESOURCE: a late/absent
+ * side or report writes null for that resource and never drops the bar
+ * session, the other market or the other reports.
+ *
+ * Quarterly/monthly MOPS-derived history columns are NOT re-fetched here. The
+ * merge carries the last published value forward across the repaired gap; the
+ * daily seed then rebuilds every derived row column from the merged histories.
  */
 import { join } from 'node:path'
 import {
   SC,
   SCREENER_HISTORY_FIELDS,
   SCREENER_HISTORY_SESSIONS,
+  isScreenerHistory,
   type ScreenerHistory,
   type ScreenerHistoryField
-} from '@odf/shared/screener'
-import { DAY_MS, dayStampOf } from '@odf/shared/session'
-import { mergeBenchmark, twseMonthIndex } from './src/benchmark'
+} from '@odf/screener-worker/screener'
+import { DAY_MS, dayStampOf, stampToMs } from '@odf/screener-worker/session'
+import { mergeBenchmark, twseMonthIndex, type IndexRow } from './src/benchmark'
+import { gapStop, latestClosedSessionMs, reverseWeekdays } from './src/backfillWindow'
+import { mergeHistorySeries } from './src/historyMerge'
+import { HISTORY_MANIFEST_KEY, mergeHistoryManifest } from './src/manifest'
+import { historyKey } from './src/keys'
 import {
   tpexDayBars,
   tpexDayFlows,
@@ -45,14 +58,8 @@ import {
   twseMarginDay,
   twseDaySblBal
 } from './src/history'
-import {
-  expectRows,
-  mopsMonthRevenue,
-  mopsQuarterMargins,
-  type QuarterMargins,
-  type RevenueDelta
-} from './src/sources/mops'
 import { runEtl } from './src/etl'
+import { classifyBarDay } from './src/safety'
 import type {
   DayBar,
   ForeignHold,
@@ -72,11 +79,25 @@ function arg(name: string): string | undefined {
 }
 
 const dryRun = process.argv.includes('--dry-run')
+/** Safety-guard mode: upload the rebuilt histories + benchmark only and let
+ *  the following daily seed rebuild the snapshot. This avoids a second ETL
+ *  publishing a partial grid after the daily run. */
+const historiesOnly = process.argv.includes('--histories-only')
+/** Reverse gap repair: start at the most recent closed weekday, bridge to the
+ *  stored series, and stop the first time a date already exists. */
+const gapFill = process.argv.includes('--gap-fill')
+/** Repair mode: the symbol filter is a real write set, not a smoke run. Used
+ *  by the CI safety guard to rebuild ONLY the histories it detected as absent
+ *  or short; the backfill still walks official weekday tables, so a holiday's
+ *  valid empty response is skipped and never becomes a zero session. */
+const repair = process.argv.includes('--repair')
 const apiBase = (arg('api') ?? DEFAULT_API).replace(/\/+$/, '')
 const fromMs = arg('from') ? Date.parse(`${arg('from')}T00:00:00+08:00`) : 0
 const toMs = arg('to') ? Date.parse(`${arg('to')}T00:00:00+08:00`) : Date.now()
-const months = Number(arg('months') ?? 36)
+const months = Math.max(1, Math.min(36, Number(arg('months') ?? 36) || 36))
 const startMs = fromMs || toMs - Math.round(months * 30.44) * DAY_MS
+/** The gap walk NEVER crosses the absolute 36-calendar-month horizon. */
+const reverseFloor = gapFill ? Math.max(startMs, toMs - Math.round(36 * 30.44) * DAY_MS) : startMs
 const symbolsArg = arg('symbols')
 const sampleCount = Number(arg('sample') ?? 0) || 0
 
@@ -122,19 +143,24 @@ async function readDaySoft<T>(
   return readDay(name, read)
 }
 
-/** Retries one per-day exchange read (timeouts and ECONNRESET are transient —
- *  an unguarded failure used to leave a PERMANENT hole in the histories). */
+/** Retries one per-day exchange read ONCE with a short exponential backoff.
+ *  A second failure returns `failed`; the caller skips that RESOURCE (null
+ *  cells) rather than aborting the whole market/run. */
 async function readDay<T>(name: string, read: () => Promise<T>): Promise<DayRead<T>> {
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       return { failed: false, value: await read() }
     } catch (err) {
-      console.warn(`[backfill] ${name} attempt ${attempt}/5 failed: ${String(err)}`)
-      if (attempt < 5) await delay(10_000 * attempt)
+      console.warn(`[backfill] ${name} attempt ${attempt}/2 failed: ${String(err)}`)
+      if (attempt < 2) await delay(1_000 * 2 ** (attempt - 1))
     }
   }
   return { failed: true, value: null }
 }
+
+/** Listing-day epochs from the same snapshot (the reverse walk never probes
+ *  before a symbol existed). */
+const listedDates = new Map<string, number>()
 
 /** The universe + the issued-share count the snapshot already implies. */
 async function loadUniverse(): Promise<Map<string, number>> {
@@ -155,6 +181,9 @@ async function loadUniverse(): Promise<Map<string, number>> {
         const close = Number(row[SC.close])
         // marketCap = shares × close / 100 → shares; 0 when either is unusable.
         out.set(symbol, marketCap > 0 && close > 0 ? (marketCap * 100) / close : 0)
+        const listed = row[SC.listedDate]
+        const listedMs = typeof listed === 'string' ? stampToMs(listed) : 0
+        if (listedMs > 0) listedDates.set(symbol, listedMs)
       }
       console.log(`[backfill] universe ${out.size} symbols from ${apiBase}`)
       return out
@@ -167,16 +196,15 @@ async function loadUniverse(): Promise<Map<string, number>> {
   throw new Error(`[backfill] universe unavailable after 3 attempts: ${String(lastErr)}`)
 }
 
-/** The weekday calendar. The per-date readers decide whether a day actually
- *  published, so a holiday simply answers an empty table and is skipped — no
- *  external calendar service is needed (or wanted). */
-function tradingDays(): number[] {
-  const days: number[] = []
-  for (let ms = startMs; ms <= toMs; ms += DAY_MS) {
-    const weekday = new Date(ms + 8 * 3_600_000).getUTCDay()
-    if (weekday !== 0 && weekday !== 6) days.push(ms)
-  }
-  console.log(`[backfill] calendar ${days.length} weekdays`)
+/** The REVERSE weekday calendar. The per-date readers decide whether a day
+ *  actually published, so a holiday simply answers an empty table and is
+ *  skipped — no external calendar service is needed (or wanted). */
+function reverseCalendar(): number[] {
+  const latest = latestClosedSessionMs(toMs)
+  const days = reverseWeekdays(latest, reverseFloor)
+  console.log(
+    `[backfill] reverse calendar ${days.length} weekdays from ${dayStampOf(latest)} to ${dayStampOf(reverseFloor)}`
+  )
   return days
 }
 
@@ -185,9 +213,8 @@ function tradingDays(): number[] {
  * the per-symbol histories from the exchange's per-date tables, then `runEtl`
  * publishes the snapshot — from the SAME tables. ONE in-process response memo
  * makes that overlap FREE (the walk's last day is the ETL's anchor): keyed by
- * method + URL + request body, successful responses only, raw BYTES (a Big5
- * MOPS page must replay byte-identically), LRU-bounded so a month-long run
- * never grows without limit.
+ * method + URL + request body, successful responses only, raw BYTES,
+ * LRU-bounded so a long run never grows without limit.
  */
 const MEMO_MAX_BYTES = 96 * 1024 * 1024
 
@@ -233,7 +260,11 @@ const writeSet = ((): Set<string> | null => {
       .split(',')
       .map((s) => s.trim())
       .filter((s) => s.length > 0)
-    console.log(`[backfill] smoke filter — ${list.length} symbols from --symbols, not uploaded`)
+    console.log(
+      repair
+        ? `[backfill] repair set — ${list.length} symbols from --symbols, uploaded`
+        : `[backfill] smoke filter — ${list.length} symbols from --symbols, not uploaded`
+    )
     return new Set(list)
   }
   if (sampleCount > 0) {
@@ -247,189 +278,64 @@ const writeSet = ((): Set<string> | null => {
   }
   return null
 })()
-const smoke = writeSet !== null
-
-// ── MOPS collector state ────────────────────────────────────────────────────
-/** symbol → MOPS PUBLISH stamp (`YYYYMMDD`) → the report. Keyed by publish (not
- *  quarter end): a value applies once technically published, no look-ahead. */
-const marginsOf = new Map<string, Map<string, QuarterMargins>>()
-const revenueOf = new Map<string, Map<string, RevenueDelta>>()
-
-function putInto<T>(
-  map: Map<string, Map<string, T>>,
-  symbol: string,
-  stamp: string,
-  value: T
-): void {
-  let per = map.get(symbol)
-  if (!per) {
-    per = new Map()
-    map.set(symbol, per)
-  }
-  per.set(stamp, value)
+const smoke = writeSet !== null && !repair
+if (repair && writeSet === null) {
+  console.error('[backfill] --repair requires --symbols (an explicit repair set)')
+  process.exit(1)
+}
+if (historiesOnly && smoke) {
+  console.error('[backfill] --histories-only requires --repair (an uploadable repair set)')
+  process.exit(1)
+}
+if (gapFill && writeSet === null) {
+  console.error('[backfill] --gap-fill requires --symbols (an explicit repair set)')
+  process.exit(1)
 }
 
-/** The newest entry at or before `stamp`. */
-function latestBefore<T>(map: Map<string, T> | undefined, stamp: string): T | null {
-  if (!map) return null
-  let best: string | null = null
-  for (const key of map.keys()) {
-    if (key <= stamp && (best === null || key > best)) best = key
-  }
-  return best === null ? null : (map.get(best) as T)
-}
-
-const pad2 = (n: number): string => String(n).padStart(2, '0')
-const gregStamp = (y: number, m: number, d: number): string => `${y}${pad2(m)}${pad2(d)}`
-
-/** The MOPS publish day (verbatim from the report note): Q1 May 16, Q2 Aug 15,
- *  Q3 Nov 15, the annual report Apr 1 of the FOLLOWING year. */
-function quarterPublishStamp(yearCn: number, season: '01' | '02' | '03' | '04'): string {
-  const y = yearCn + 1911
-  switch (season) {
-    case '01':
-      return gregStamp(y, 5, 16)
-    case '02':
-      return gregStamp(y, 8, 15)
-    case '03':
-      return gregStamp(y, 11, 15)
-    case '04':
-      return gregStamp(y + 1, 4, 1)
-  }
-}
-
-/** A month's revenue publishes from the 10th of the NEXT month. */
-function monthPublishStamp(year: number, month: number): string {
-  return month === 12 ? gregStamp(year + 1, 1, 10) : gregStamp(year, month + 1, 10)
-}
-
-const SEASONS = ['01', '02', '03', '04'] as const
-const MARKETS_SRC = ['sii', 'otc'] as const
-
-/** The quarters whose publish day has passed AND that can still apply to the
- *  window (one extra quarter before `startMs` is the carry-in value). */
-function quartersFor(today: string): Array<{ yearCn: number; season: (typeof SEASONS)[number] }> {
-  const startY = new Date(startMs + 8 * 3_600_000).getUTCFullYear() - 1911
-  const endY = new Date(toMs + 8 * 3_600_000).getUTCFullYear() - 1911
-  const floor = dayStampOf(startMs - 200 * DAY_MS)
-  const out: Array<{ yearCn: number; season: (typeof SEASONS)[number] }> = []
-  for (let yearCn = startY - 1; yearCn <= endY; yearCn++) {
-    for (const season of SEASONS) {
-      const publish = quarterPublishStamp(yearCn, season)
-      // STRICTLY before today: a report published today may not be up yet,
-      // and an empty parse must never fail the run.
-      if (publish < today && publish >= floor) out.push({ yearCn, season })
-    }
-  }
-  return out
-}
-
-/** The months whose revenue has published AND can still apply to the window. */
-function monthsFor(today: string): Array<{ year: number; month: number }> {
-  const out: Array<{ year: number; month: number }> = []
-  const start = new Date(startMs - 70 * DAY_MS + 8 * 3_600_000)
-  let year = start.getUTCFullYear()
-  let month = start.getUTCMonth() + 1
-  for (;;) {
-    const publish = monthPublishStamp(year, month)
-    // A month publishing TODAY is an empty shell for part of the day — only
-    // completed publishes are read (a 0-row parse would fail the run).
-    if (publish >= today) break
-    out.push({ year, month })
-    if (year > new Date(toMs + 8 * 3_600_000).getUTCFullYear() + 1) break
-    month += 1
-    if (month > 12) {
-      month = 1
-      year += 1
-    }
-  }
-  return out
-}
-
-/** One MOPS task = one report fetch. A failure is retried ONCE (a 2nd round
- *  after the day walk) and then blocks the publish (settled-or-fail). */
-interface MopsTask {
-  label: string
-  minRows: number
-  run: () => Promise<void>
-}
-
-function mopsTasks(today: string): MopsTask[] {
-  const tasks: MopsTask[] = []
-  for (const { yearCn, season } of quartersFor(today)) {
-    const publish = quarterPublishStamp(yearCn, season)
-    for (const market of MARKETS_SRC) {
-      tasks.push({
-        label: `mops Q${yearCn}${season} ${market}`,
-        minRows: 300,
-        run: async () => {
-          const rows = expectRows(
-            await mopsQuarterMargins(yearCn, season, market),
-            300,
-            `mops Q${yearCn}${season} ${market}`
-          )
-          for (const [symbol, value] of rows) putInto(marginsOf, symbol, publish, value)
-        }
-      })
-    }
-  }
-  for (const { year, month } of monthsFor(today)) {
-    const yearCn = year - 1911
-    const publish = monthPublishStamp(year, month)
-    for (const market of MARKETS_SRC) {
-      for (const foreign of [false, true]) {
-        tasks.push({
-          label: `mops ${yearCn}/${month} ${market}${foreign ? ' KY' : ''}`,
-          // The domestic file always holds the whole market; a KY file can be
-          // legitimately empty in an early month, so only the domestic read
-          // asserts a floor (the parser drift it catches is shared by both).
-          minRows: foreign ? 0 : 1,
-          run: async () => {
-            const label = `mops ${yearCn}/${month} ${market}${foreign ? ' KY' : ''}`
-            const rows = await mopsMonthRevenue(yearCn, month, market, foreign)
-            if (!foreign) expectRows(rows, 1, label)
-            if (rows.size === 0) {
-              console.log(`[backfill] ${label}: no rows`)
-              return
-            }
-            for (const [symbol, value] of rows) putInto(revenueOf, symbol, publish, value)
-          }
-        })
-      }
-    }
-  }
-  return tasks
-}
-
-/** Runs every MOPS task; a failed one is re-attempted once in a second round.
- *  A surviving failure is returned (the caller refuses to publish). */
-async function collectMops(): Promise<string[]> {
-  const today = dayStampOf(Date.now())
-  const tasks = mopsTasks(today)
-  console.log(`[backfill] mops ${tasks.length} reports`)
-  let pending = tasks
-  for (let round = 1; round <= 2 && pending.length > 0; round++) {
-    const failed: MopsTask[] = []
-    for (const task of pending) {
+/** Reverse-gap state: the stored series for each target, its dates for the
+ *  local stop, and the mutable active set the day walk records from. */
+const existingHistories = new Map<string, ScreenerHistory>()
+const existingDates = new Map<string, Set<string>>()
+let activeRepair: Set<string> | null = null
+let recordSet: Set<string> | null = writeSet
+const EMPTY_DATES: ReadonlySet<string> = new Set()
+if (gapFill && writeSet) {
+  if (!process.argv.includes('--keep')) await resetSeedRoot()
+  activeRepair = new Set(writeSet)
+  recordSet = activeRepair
+  const repairEnv = createFsEnv()
+  for (const symbol of writeSet) {
+    try {
+      const obj = await repairEnv.R2_BUCKET.get(historyKey(symbol))
+      if (!obj) continue
+      const text = await obj.text()
+      let parsed: unknown
       try {
-        await task.run()
-      } catch (err) {
-        console.warn(`[backfill] ${task.label} round ${round} failed: ${String(err)}`)
-        failed.push(task)
+        parsed = JSON.parse(text)
+      } catch {
+        console.warn(`[backfill] ${symbol} stored history unreadable — rebuilding from scratch`)
+        continue
       }
+      if (!isScreenerHistory(parsed, symbol)) {
+        console.warn(`[backfill] ${symbol} stored history invalid — rebuilding from scratch`)
+        continue
+      }
+      existingHistories.set(symbol, parsed)
+      existingDates.set(symbol, new Set(parsed.dates))
+    } catch (err) {
+      // A storage read failure must never be mistaken for an absent history:
+      // abort before any write rather than replace a good series with a rebuild.
+      console.error(`[backfill] ${symbol} stored history read failed — aborting: ${String(err)}`)
+      process.exit(1)
     }
-    pending = failed
-    if (pending.length > 0 && round < 2) await delay(30_000)
   }
   console.log(
-    `[backfill] mops margins=${marginsOf.size} revenue=${revenueOf.size}` +
-      (pending.length > 0 ? ` — FAILED: ${pending.map((t) => t.label).join(' ')}` : '')
+    `[backfill] gap target ${writeSet.size}; ${existingHistories.size} with stored history`
   )
-  return pending.map((t) => t.label)
 }
 
 // ── the day walk ────────────────────────────────────────────────────────────
-const days = tradingDays()
+const days = reverseCalendar()
 const accs = new Map<string, Acc>()
 let sessions = 0
 const sourceDays = {
@@ -447,7 +353,6 @@ const sourceDays = {
 /** Days whose market read STILL failed after the re-queue — a missing real
  *  session shifts every rolling column, so the run refuses to publish such
  *  histories (nonzero exit, nothing uploaded) instead of guessing. */
-const failedDays: Array<{ market: 'TWSE' | 'TPEX'; dateMs: number; what: string }> = []
 /** Idempotent per-(market, day) counters — the re-queue re-walks whole days. */
 const counted = {
   twse: new Set<number>(),
@@ -474,27 +379,49 @@ interface DayMarket {
   dayTrade: Map<string, number> | null
 }
 
+/** One market's daily bars. A holiday/typhoon answers a VALID EMPTY table;
+ *  a transient edge miss on a real session can look identical, so an empty
+ *  result is read ONCE more after a short pause. Two empties = no session. */
+async function readBarsDay(
+  name: string,
+  read: () => Promise<Map<string, DayBar> | null>
+): Promise<DayRead<Map<string, DayBar> | null>> {
+  const first = await readDay(name, read)
+  if (first.failed || (first.value && first.value.size > 0)) return first
+  await delay(2_000)
+  return readDay(name, read)
+}
+
 /** One session's walk: the per-date exchange tables → per-symbol acc rows.
  *  IDEMPOTENT per (symbol, stamp) — the re-queue re-runs whole days safely,
  *  inserting at the sorted position when later sessions already accumulated
  *  and patching still-null cells (e.g. flows that failed before) in place.
- *  A FAILED market read (never a holiday's empty table) lands in failedDays. */
+ *  Each market/report is an independent resource: an absent side is skipped
+ *  for that day, never a reason to discard the session. */
 async function processDay(dateMs: number, index: number, total: number): Promise<void> {
   const stamp = dayStampOf(dateMs)
   if (!stamp) return
 
   // An EMPTY map is "no session" too: TPEx answers a valid, empty table on a
   // holiday, so truthiness alone would count the day as a session.
-  const twseRead = await readDay(`${stamp} TWSE bars`, () => twseDayBars(dateMs))
-  if (twseRead.failed) failedDays.push({ market: 'TWSE', dateMs, what: 'bars' })
-  const tpexRead = await readDay(`${stamp} TPEx bars`, () => tpexDayBars(dateMs))
-  if (tpexRead.failed) failedDays.push({ market: 'TPEX', dateMs, what: 'bars' })
+  const twseRead = await readBarsDay(`${stamp} TWSE bars`, () => twseDayBars(dateMs))
+  const tpexRead = await readBarsDay(`${stamp} TPEx bars`, () => tpexDayBars(dateMs))
   const twseBars = twseRead.value && twseRead.value.size > 0 ? twseRead.value : null
   const tpexBars = tpexRead.value && tpexRead.value.size > 0 ? tpexRead.value : null
-  if (!twseBars && !tpexBars) {
-    if (index % 20 === 0) console.log(`[backfill] ${stamp} no session (skipped)`)
+  const kind = classifyBarDay(!!twseBars, !!tpexBars)
+  if (kind === 'closed') {
+    if (twseRead.failed || tpexRead.failed) {
+      console.log(`[backfill] ${stamp} both bar resources unavailable — skipped`)
+    } else if (index % 20 === 0) {
+      console.log(`[backfill] ${stamp} no session (skipped)`)
+    }
     return
   }
+  // Each exchange is its OWN resource: a missing/empty side is skipped for
+  // this day, never allowed to drop the other side's session. The exchanges
+  // publish separate RWD tables, so one market's late/absent file is normal.
+  if (kind === 'twse-missing') console.log(`[backfill] ${stamp} TWSE bars empty — skipped`)
+  if (kind === 'tpex-missing') console.log(`[backfill] ${stamp} TPEx bars empty — skipped`)
 
   const markets: Array<['TWSE' | 'TPEX', DayMarket | null]> = []
   if (twseBars) {
@@ -506,12 +433,8 @@ async function processDay(dateMs: number, index: number, total: number): Promise
       readDay(`${stamp} TWSE valuation`, () => twseDayValuation(dateMs)),
       readDaySoft(`${stamp} TWSE dayTrade`, () => twseDayTrade(dateMs))
     ])
-    if (flowsRead.failed) failedDays.push({ market: 'TWSE', dateMs, what: 'flows' })
-    if (marginRead.failed) failedDays.push({ market: 'TWSE', dateMs, what: 'margin' })
-    if (sblRead.failed) failedDays.push({ market: 'TWSE', dateMs, what: 'sbl' })
-    if (foreignRead.failed) failedDays.push({ market: 'TWSE', dateMs, what: 'foreign' })
-    if (valRead.failed) failedDays.push({ market: 'TWSE', dateMs, what: 'valuation' })
-    if (dayTradeRead.failed) failedDays.push({ market: 'TWSE', dateMs, what: 'dayTrade' })
+    // Resource-wise: a missing report writes null cells for that resource; it
+    // never discards the bar session or the other resources that DID answer.
     markets.push([
       'TWSE',
       {
@@ -538,12 +461,7 @@ async function processDay(dateMs: number, index: number, total: number): Promise
       readDay(`${stamp} TPEx sbl`, () => tpexDaySblBal(dateMs)),
       readDaySoft(`${stamp} TPEx dayTrade`, () => tpexDayTrade(dateMs))
     ])
-    if (flowsRead.failed) failedDays.push({ market: 'TPEX', dateMs, what: 'flows' })
-    if (marginRead.failed) failedDays.push({ market: 'TPEX', dateMs, what: 'margin' })
-    if (foreignRead.failed) failedDays.push({ market: 'TPEX', dateMs, what: 'foreign' })
-    if (valRead.failed) failedDays.push({ market: 'TPEX', dateMs, what: 'valuation' })
-    if (sblRead.failed) failedDays.push({ market: 'TPEX', dateMs, what: 'sbl' })
-    if (dayTradeRead.failed) failedDays.push({ market: 'TPEX', dateMs, what: 'dayTrade' })
+    // Resource-wise: use every report that answered; leave absent ones null.
     markets.push([
       'TPEX',
       {
@@ -596,7 +514,7 @@ async function processDay(dateMs: number, index: number, total: number): Promise
     }
 
     for (const [symbol, bar] of day.bars) {
-      if (writeSet && !writeSet.has(symbol)) continue
+      if (recordSet && !recordSet.has(symbol)) continue
       const baseShares = universe.get(symbol)
       if (baseShares === undefined) continue
       const price = bar.close / 100
@@ -626,15 +544,15 @@ async function processDay(dateMs: number, index: number, total: number): Promise
         shortBal: day.margin?.get(symbol)?.shortBal ?? null,
         sblBal: day.sbl?.get(symbol)?.sblBal ?? null,
         riskFlags: null, // the risk lists publish no per-date history — daily accrual
-        grossMargin: latestBefore(marginsOf.get(symbol), stamp)?.gross ?? null,
-        opMargin: latestBefore(marginsOf.get(symbol), stamp)?.op ?? null,
-        pretaxMargin: latestBefore(marginsOf.get(symbol), stamp)?.pretax ?? null,
-        netMargin: latestBefore(marginsOf.get(symbol), stamp)?.net ?? null,
-        revenueMom: latestBefore(revenueOf.get(symbol), stamp)?.mom ?? null,
-        revenueYoy: latestBefore(revenueOf.get(symbol), stamp)?.yoy ?? null,
-        revenueCumYoy: latestBefore(revenueOf.get(symbol), stamp)?.cumYoy ?? null,
-        revenueMonth: latestBefore(revenueOf.get(symbol), stamp)?.revenueMonth ?? null,
-        revenueYm: latestBefore(revenueOf.get(symbol), stamp)?.revenueYm ?? null,
+        grossMargin: null,
+        opMargin: null,
+        pretaxMargin: null,
+        netMargin: null,
+        revenueMom: null,
+        revenueYoy: null,
+        revenueCumYoy: null,
+        revenueMonth: null,
+        revenueYm: null,
         foreignShares: day.foreign?.get(symbol)?.shares ?? null,
         foreignRatio: day.foreign?.get(symbol)?.ratio ?? null,
         dayTradeShares: day.dayTrade ? (day.dayTrade.get(symbol) ?? 0) : null
@@ -670,20 +588,53 @@ async function processDay(dateMs: number, index: number, total: number): Promise
   }
 }
 
+const bridged = new Set<string>()
+
 /** The per-day exchange walk — builds `accs` on the exchanges' OWN budget
- *  (polite gate + bandwidth); it never touches a third-party API. Runs
- *  CONCURRENTLY with `collectMops` (different host, same gate). */
+ *  (polite gate + bandwidth); it never touches a third-party API. */
 async function walkDays(): Promise<void> {
-  for (let i = 0; i < days.length; i++) await processDay(days[i], i, days.length)
-  // One re-queue round: transient outages often clear within minutes — a
-  // second walk over just the failed days catches them without a full re-run.
-  // Dedupe per (market, day): several sources of one day share the re-walk.
-  const retry = [...new Map(failedDays.map((f) => [`${f.market}:${f.dateMs}`, f])).values()]
-  if (retry.length > 0) {
-    console.log(`[backfill] re-queuing ${retry.length} failed day reads after a 60 s cool-down`)
-    await delay(60_000)
-    failedDays.splice(0)
-    for (const failed of retry) await processDay(failed.dateMs, -1, days.length)
+  for (let i = 0; i < days.length; i++) {
+    const dateMs = days[i]
+    const stamp = dayStampOf(dateMs)
+    if (activeRepair) {
+      // LOCAL CHECK FIRST: a date already in the stored series bridges the
+      // contiguous gap for that symbol — never fetch/record it again.
+      for (const symbol of [...activeRepair]) {
+        const action = gapStop(stamp, dateMs, {
+          existingDates: existingDates.get(symbol) ?? EMPTY_DATES,
+          listedMs: listedDates.get(symbol) ?? 0,
+          collected: sessions,
+          quota: existingHistories.has(symbol) ? 0 : SCREENER_HISTORY_SESSIONS
+        })
+        if (action === 'continue') continue
+        activeRepair.delete(symbol)
+        if (action === 'bridged') bridged.add(symbol)
+        if (action !== 'bridged') {
+          console.log(`[backfill] ${symbol} ${action} at ${stamp} — stopping its scan`)
+        }
+      }
+      if (activeRepair.size === 0) {
+        console.log(`[backfill] all gap targets stopped at ${stamp}`)
+        break
+      }
+    }
+    await processDay(dateMs, i, days.length)
+  }
+  // A stored series MUST reach its own last date before the horizon. Otherwise
+  // writing the collected prefix would create a hole between it and the old
+  // series — refuse the whole repair instead.
+  if (gapFill) {
+    const unbridged = [...existingHistories.keys()].filter((s) => !bridged.has(s))
+    if (unbridged.length > 0) {
+      console.error(
+        `[backfill] horizon reached before bridging stored histories: ${unbridged.join(' ')} — aborting`
+      )
+      process.exit(1)
+    }
+    if (sessions === 0) {
+      console.log('[backfill] no missing trading session — nothing to write')
+      process.exit(0)
+    }
   }
   // Per-source coverage is the ONE line that exposes a silently failing reader
   // (a title-format change once dropped every TWSE session for ten months).
@@ -697,26 +648,8 @@ async function walkDays(): Promise<void> {
   )
 }
 
-// Both phases run at once: the MOPS host and the exchanges are different
-// endpoints, and the polite gate serializes only the requests themselves.
-const mopsTask = collectMops()
 await walkDays()
-const failedMops = await mopsTask
 
-// THE SETTLED-OR-FAIL GATE: a missing real session (or a missing report) shifts
-// every rolling column, so hole-y histories are never written, never uploaded.
-if (failedDays.length > 0) {
-  console.error(
-    `[backfill] ${failedDays.length} day reads still failed after the re-queue (${failedDays
-      .map((f) => `${f.market}:${dayStampOf(f.dateMs)}:${f.what}`)
-      .join(' ')}) — refusing to publish hole-y histories`
-  )
-  process.exit(1)
-}
-if (failedMops.length > 0) {
-  console.error(`[backfill] MOPS reports failed: ${failedMops.join(' ')} — refusing to publish`)
-  process.exit(1)
-}
 // The write gate: every column must stay index-aligned on `dates` — a splice
 // bug would corrupt every rolling derivation downstream, so refuse to write.
 for (const [symbol, a] of accs) {
@@ -731,27 +664,21 @@ for (const [symbol, a] of accs) {
 
 if (!process.argv.includes('--keep')) await resetSeedRoot()
 
-if (sessions === 0) {
+if (sessions === 0 && !gapFill) {
   console.error('[backfill] no sessions fetched — nothing written')
   process.exit(1)
 }
-if (sourceDays.twse === 0 || sourceDays.tpex === 0) {
-  console.error('[backfill] a whole market produced no sessions — aborting')
-  process.exit(1)
-}
-if (writeSet) {
+if (writeSet && !gapFill) {
   const missing = [...writeSet].filter((s) => !accs.has(s))
   if (missing.length > 0) {
     console.warn(`[backfill] requested symbols without rows: ${missing.join(' ')}`)
   }
 }
 
-let written = 0
-for (const [symbol, a] of accs) {
-  if (a.dates.length === 0) continue
+function historyFromAcc(symbol: string, a: Acc): ScreenerHistory {
   const drop = Math.max(0, a.dates.length - SCREENER_HISTORY_SESSIONS)
   const slice = <T>(list: T[]): T[] => (drop > 0 ? list.slice(drop) : list)
-  const history: ScreenerHistory = {
+  return {
     symbol,
     dates: slice(a.dates),
     open: slice(a.open),
@@ -786,10 +713,48 @@ for (const [symbol, a] of accs) {
     foreignRatio: slice(a.foreignRatio),
     dayTradeShares: slice(a.dayTradeShares)
   }
-  await Bun.write(join(SEED_ROOT, 'history', `${symbol}.json`), JSON.stringify(history))
+}
+
+const toWrite: ScreenerHistory[] = []
+if (gapFill && writeSet) {
+  for (const symbol of writeSet) {
+    const a = accs.get(symbol)
+    if (!a || a.dates.length === 0) {
+      if (!existingHistories.has(symbol)) console.warn(`[backfill] ${symbol} produced no rows`)
+      continue
+    }
+    const next = historyFromAcc(symbol, a)
+    const merged = mergeHistorySeries(existingHistories.get(symbol) ?? null, next)
+    if (merged) toWrite.push(merged)
+  }
+} else {
+  for (const [symbol, a] of accs) {
+    if (a.dates.length === 0) continue
+    toWrite.push(historyFromAcc(symbol, a))
+  }
+}
+
+let written = 0
+for (const history of toWrite) {
+  await Bun.write(join(SEED_ROOT, 'history', `${history.symbol}.json`), JSON.stringify(history))
   written++
 }
 console.log(`[backfill] wrote ${written} histories under ${SEED_ROOT}`)
+
+// The safety guard's ONE index: the repaired targets' newest session. The
+// uploader merges this partial map into the bucket's existing manifest, so a
+// gap repair never erases entries for symbols it did not touch.
+const manifestUpdates = new Map<string, string>()
+for (const history of toWrite) {
+  const last = history.dates.at(-1)
+  if (last) manifestUpdates.set(history.symbol, last)
+}
+if (manifestUpdates.size > 0) {
+  await Bun.write(
+    join(SEED_ROOT, HISTORY_MANIFEST_KEY),
+    JSON.stringify(mergeHistoryManifest(null, manifestUpdates))
+  )
+}
 
 // The TAIEX series the header's benchmark returns read: one FMTQIK request per
 // calendar month in the window.
@@ -800,15 +765,46 @@ for (let ms = startMs; ms <= toMs; ms += DAY_MS) {
   const first = Date.UTC(y, m, 1) - 8 * 3_600_000
   if (monthStarts.at(-1) !== first) monthStarts.push(first)
 }
-const indexRows = []
+const indexRows: IndexRow[] = []
+let benchmarkFailed = false
 for (const monthMs of monthStarts) {
-  indexRows.push(...(await twseMonthIndex(monthMs).catch(() => [])))
+  try {
+    const rows = await twseMonthIndex(monthMs)
+    if (rows.length === 0) throw new Error('empty monthly table')
+    indexRows.push(...rows)
+  } catch (err) {
+    benchmarkFailed = true
+    console.error(`[backfill] benchmark month ${dayStampOf(monthMs)} failed: ${String(err)}`)
+  }
+}
+if (benchmarkFailed && !smoke && !dryRun) {
+  console.error('[backfill] benchmark incomplete — refusing to write/upload a partial series')
+  process.exit(1)
 }
 const series = mergeBenchmark(null, indexRows)
+if (series.dates.length < 240 && !smoke && !dryRun) {
+  console.error(`[backfill] benchmark has only ${series.dates.length} sessions (< 240) — aborting`)
+  process.exit(1)
+}
 await Bun.write(join(SEED_ROOT, 'benchmark.json'), JSON.stringify(series))
 console.log(
   `[backfill] benchmark ${series.dates.length} sessions (${series.dates[0]} -> ${series.dates.at(-1)})`
 )
+
+// The safety guard writes only the repaired histories + benchmark. The daily
+// seed follows and rebuilds the snapshot from these objects, so a partial
+// second ETL cannot overwrite a complete daily grid.
+if (historiesOnly) {
+  if (dryRun) {
+    console.log('[backfill] histories-only dry run — objects left in .seed-out/')
+    process.exit(0)
+  }
+  const { files, failed } = await uploadSeedRoot()
+  console.log(
+    `[backfill] histories-only done: ${files - failed}/${files} uploaded, ${failed} failed`
+  )
+  process.exit(failed > 0 ? 1 : 0)
+}
 
 // History first, snapshot second: the ETL reads those histories, appends the
 // live session, and re-derives every rolling column from them.
@@ -817,6 +813,12 @@ const result = await runEtl(createFsEnv(), Date.now(), { force: true })
 console.log(`[backfill] etl ${JSON.stringify(result)} in ${Date.now() - started} ms`)
 if (result.skipped) {
   console.error('[backfill] the ETL skipped — the snapshot was not rebuilt')
+  process.exit(1)
+}
+if (result.partial.length > 0 && !dryRun) {
+  console.error(
+    `[backfill] the ETL is partial (${result.partial.join(',')}) — refusing to upload a partial rebuild`
+  )
   process.exit(1)
 }
 

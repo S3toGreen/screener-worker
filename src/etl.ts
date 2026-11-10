@@ -38,14 +38,14 @@ import {
   type MarketContext,
   type ScreenerRow,
   type ScreenerSnapshot
-} from '@odf/shared/screener'
+} from '@odf/screener-worker/screener'
 import {
   estimatedMaintenanceRatio,
   MARGIN_COST_STATE_VERSION,
   rollAverageMarginCost,
   sanitizeCreditState,
   type CreditStateFile
-} from '@odf/shared/credit'
+} from '@odf/screener-worker/credit'
 import {
   DAY_MS,
   STOCK_CLOSE_TOD_MS,
@@ -53,8 +53,14 @@ import {
   dayStampOf,
   stampToMs,
   todOf
-} from '@odf/shared/session'
-import { isFundSymbol } from '@odf/shared/screener'
+} from '@odf/screener-worker/session'
+import { isFundSymbol } from '@odf/screener-worker/screener'
+import {
+  HISTORY_MANIFEST_KEY,
+  mergeHistoryManifest,
+  readHistoryManifest,
+  type HistoryManifest
+} from './manifest'
 import type { ScreenerEnv } from './env'
 import {
   tpexDayFlows,
@@ -99,10 +105,12 @@ import {
 } from './sources/tpex'
 import {
   BENCHMARK_KEY,
+  benchmarkMonthStarts,
   benchmarkReturns,
   mergeBenchmark,
   shapedBenchmark,
-  twseMonthIndex
+  twseMonthIndex,
+  type IndexRow
 } from './benchmark'
 import { DATA_CACHE_CONTROL, DIVIDENDS_KEY, historyKey } from './keys'
 import { taifexDerivatives } from './sources/taifex'
@@ -669,6 +677,18 @@ export async function runEtl(
     const merged = appendSession(history, seed.symbol, stamp, seed, stats)
     rollSeedMarginCost(seed, merged, credit, stamp)
     const row = buildRow(seed, merged, stamp)
+    // An ESTABLISHED symbol with no readable history must not be given a
+    // one-session stub: that stub makes the safety guard's newest-date check
+    // look healthy and permanently hides the missing 3-year series. Publish the
+    // current row (so the grid stays complete) but leave the history absent for
+    // the safety guard's reverse rebuild. A genuinely NEW listing (the previous
+    // snapshot did not contain it) still starts with its first session.
+    const establishedMissing = prior === null && prev !== null && prevRows.has(seed.symbol)
+    if (establishedMissing) {
+      console.log(
+        `[etl] history ${seed.symbol} absent — row published, history left for safety guard`
+      )
+    }
     // A same-session re-run may have lost a live source (a late/regenerated
     // reader failed this pass). The earlier row is the SAME session's published
     // truth, so fill only its null/empty cells; new finite values always win.
@@ -676,6 +696,7 @@ export async function runEtl(
       const priorRow = prevRows.get(seed.symbol)
       if (priorRow) preserveRowCells(row, priorRow)
     }
+    if (establishedMissing) return { ok: true, row, historyLast: null }
     const body = JSON.stringify(merged)
     // A guard run re-appends the SAME session: when the serialized bytes match
     // the stored object, NOTHING is written. That makes the 03:45 guard a
@@ -684,7 +705,7 @@ export async function runEtl(
     // files are the entire upload cost).
     if (prior !== null && body === prior.text) {
       stats.unchanged++
-      return { ok: true, row }
+      return { ok: true, row, historyLast: merged.dates.at(-1) ?? null }
     }
     try {
       await withRetry(`history ${seed.symbol} put`, 3, () =>
@@ -700,9 +721,17 @@ export async function runEtl(
       degraded.add('history-put')
       return { ok: false, seed }
     }
-    return { ok: true, row }
+    return { ok: true, row, historyLast: merged.dates.at(-1) ?? null }
   })
   await saveCreditState(env, credit, stamp, degraded)
+  // The single history index the CI safety guard reads instead of 2 400
+  // per-object GETs. A failed write is not a data failure: the guard falls back
+  // to the objects themselves, so the daily publication still proceeds.
+  const updates = new Map<string, string>()
+  for (const out of fresh) {
+    if (out.ok && out.historyLast) updates.set(String(out.row[SC.symbol]), out.historyLast)
+  }
+  if (updates.size > 0) await writeHistoryManifest(env, updates)
   if (stats.preserved > 0) {
     console.log(`[etl] preserved ${stats.preserved} prior cells on the same-session re-run`)
   }
@@ -765,9 +794,19 @@ export async function runEtl(
         priorText = null
       }
     }
-    const month = await twseMonthIndex(sessionDate).catch(() => [])
-    if (month.length === 0) console.log(`[etl] benchmark month unavailable for ${stamp}`)
-    const series = mergeBenchmark(prior, month)
+    // A missing/truncated benchmark must not be replaced with only the current
+    // month. Fetch the last 13 FMTQIK months when the stored series is absent
+    // or short; a healthy series needs only its current month.
+    const months = prior === null || prior.dates.length < 240 ? 13 : 1
+    if (months > 1) console.log(`[etl] benchmark backfill — reading ${months} months`)
+    const monthRows: IndexRow[] = []
+    for (const monthMs of benchmarkMonthStarts(sessionDate, months)) {
+      const rows = await twseMonthIndex(monthMs).catch(() => [])
+      if (rows.length === 0) continue
+      monthRows.push(...rows)
+    }
+    if (monthRows.length === 0) console.log(`[etl] benchmark month unavailable for ${stamp}`)
+    const series = mergeBenchmark(prior, monthRows)
     benchmark = benchmarkReturns(series)
     const body = JSON.stringify(series)
     if (priorText === body) {
@@ -832,7 +871,17 @@ export async function runEtl(
         priorContext && priorContext.asOf === market.asOf
           ? mergeMarketContext(priorContext, market)
           : market
-      merged.history = mergeMarketHistory(priorContext?.history, merged, priorContext)
+      // Primary path: seedMarketHistory.ts uploads the full series out-of-band.
+      // Safety guard: if the series is missing, start it from the prior object
+      // (when available) plus the current session, so the panel cannot stay
+      // permanently empty after a fresh bucket.
+      const hadHistory = (priorContext?.history?.length ?? 0) > 0
+      const history = mergeMarketHistory(priorContext?.history, merged, priorContext)
+      if (history.length > 0) merged.history = history
+      if (!hadHistory)
+        console.log(
+          `[etl] market history seeded by the daily safety guard (${history.length} observation(s)); seedMarketHistory.ts remains the full-series path`
+        )
       const body = JSON.stringify(merged)
       if (priorText === body) {
         console.log('[etl] market context unchanged — not rewritten')
@@ -1319,7 +1368,8 @@ export interface Seed {
 }
 
 /** One seed's result: a built row, or a failure that degrades to a carry. */
-type SeedOutcome = { ok: true; row: ScreenerRow } | { ok: false; seed: Seed }
+type SeedOutcome =
+  { ok: true; row: ScreenerRow; historyLast: string | null } | { ok: false; seed: Seed }
 
 /** One extra read when the archive answered empty (an edge miss). */
 async function dayTradeRetry<T>(read: () => Promise<T | null>): Promise<T | null> {
@@ -1745,6 +1795,38 @@ async function readSnapshot(
     return { snap: ok ? parsed : null, text }
   } catch {
     return { snap: null, text }
+  }
+}
+
+/** Reads the one history manifest; a missing/corrupt object starts empty. */
+async function readHistoryManifestFromEnv(env: ScreenerEnv): Promise<HistoryManifest | null> {
+  try {
+    const obj = await env.R2_BUCKET.get(HISTORY_MANIFEST_KEY)
+    if (!obj) return null
+    const manifest = readHistoryManifest(JSON.parse(await obj.text()))
+    if (!manifest) console.log('[etl] history manifest unreadable — rebuilding from this run')
+    return manifest
+  } catch (err) {
+    // A failed read must not fail a run whose histories are already durable.
+    console.log(`[etl] history manifest read failed — rebuilding from this run: ${String(err)}`)
+    return null
+  }
+}
+
+/** Merges + writes the manifest; the uploader merges it again for the .seed-out path. */
+async function writeHistoryManifest(env: ScreenerEnv, updates: Map<string, string>): Promise<void> {
+  const current = await readHistoryManifestFromEnv(env)
+  const next = mergeHistoryManifest(current, updates)
+  try {
+    await env.R2_BUCKET.put(HISTORY_MANIFEST_KEY, JSON.stringify(next), {
+      httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: 'no-store' }
+    })
+    console.log(
+      `[etl] history manifest ${Object.keys(next.symbols).length} symbols (${updates.size} updated)`
+    )
+  } catch (err) {
+    // Private index only; the safety guard's fallback scan remains correct.
+    console.log(`[etl] history manifest write failed — safety will rescan: ${String(err)}`)
   }
 }
 

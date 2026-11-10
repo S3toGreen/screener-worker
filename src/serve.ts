@@ -28,7 +28,7 @@ import {
   SCREENER_MARKET_PATH,
   SCREENER_SNAPSHOT_KEY,
   SCREENER_SNAPSHOT_PATH
-} from '@odf/shared/screener'
+} from '@odf/screener-worker/screener'
 import type { ScreenerEnv } from './env'
 import {
   CACHE_VERSION_KEY,

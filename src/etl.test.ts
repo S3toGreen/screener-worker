@@ -6,8 +6,8 @@ import {
   SCREENER_HISTORY_SESSIONS,
   type ScreenerHistory,
   type ScreenerRow
-} from '@odf/shared/screener'
-import { stampToMs } from '@odf/shared/session'
+} from '@odf/screener-worker/screener'
+import { stampToMs } from '@odf/screener-worker/session'
 import {
   anchorDaily,
   buildMarketContext,

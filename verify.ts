@@ -34,8 +34,8 @@ import {
   screenerHoldingsUrl,
   screenerMarketUrl,
   screenerSnapshotUrl
-} from '@odf/shared/screener'
-import { SCREENER_CDN_DEFAULT } from '@odf/shared/protocol'
+} from '@odf/screener-worker/screener'
+import { SCREENER_CDN_DEFAULT } from '@odf/screener-worker/config'
 
 const arg = (name: string, fallback: string): string => {
   const i = process.argv.indexOf(`--${name}`)

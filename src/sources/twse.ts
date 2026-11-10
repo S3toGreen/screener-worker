@@ -17,8 +17,8 @@ import {
   RISK_PERIODIC,
   RISK_STOP_FUNDS,
   RISK_STOP_TRADING
-} from '@odf/shared/screener'
-import { dayStampOf } from '@odf/shared/session'
+} from '@odf/screener-worker/screener'
+import { dayStampOf } from '@odf/screener-worker/session'
 import {
   changePctOf,
   dateToMs,
@@ -30,9 +30,9 @@ import {
   rawPrice,
   ymToMs,
   type FetchLike
-} from '@odf/shared/httpJson'
+} from '@odf/screener-worker/httpJson'
 import { isScreenerSymbol } from '../universe'
-import type { DividendEvent } from '@odf/shared/screener'
+import type { DividendEvent } from '@odf/screener-worker/screener'
 import {
   mapTableRows,
   readMembers,

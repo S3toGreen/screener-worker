@@ -8,7 +8,7 @@
 # Workers Free plan (50 subrequests / 10 ms CPU per invocation, and `limits` is
 # rejected there), while one ETL run makes ~4 000 R2 operations. The Pages
 # function stays a free read-only CDN; this job runs the SAME `runEtl` from
-# `apps/screener-worker/src/etl.ts`, reads the PREVIOUS objects straight from
+# `src/etl.ts`, reads the PREVIOUS objects straight from
 # R2 through the S3 API and pushes the new ones the same way (`seedFs.ts`).
 #
 # Required repository secrets:
@@ -63,10 +63,10 @@ jobs:
     # Pinned: `ubuntu-latest` migrates to Ubuntu 26 (see the runner's own
     # warning); a data job must not change base images behind our back.
     runs-on: ubuntu-latest
-    # Room for the seed (≤20) + verify + installs; seed.ts owns its ONE forced
-    # retry internally (skipped when the run was already forced), so there is
-    # no second ETL step to budget for.
-    timeout-minutes: 30
+    # Room for the seed (≤20) + a rare full history repair + verify + installs;
+    # seed.ts owns its ONE forced retry internally (skipped when the run was
+    # already forced), so there is no second ETL step to budget for.
+    timeout-minutes: 60
     # ONE place the R2 configuration lives: every step (seed, verify) inherits
     # it, and the preflight below fails in the first second when a repository
     # secret is missing — the 2026-10-30 run went green WITHOUT credentials
@@ -97,44 +97,39 @@ jobs:
             fi
           done
 
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 12
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: pnpm
-
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.3
 
-      # Scoped to what the ETL runs: the worker + @odf/shared, plus the ROOT
-      # (its devDeps carry `tsc`, which the typecheck step runs). The desktop /
-      # mobile / server workspaces are never installed — a cold run downloads
-      # ~650 MB less (electron, duckdb, grpc) and their postinstalls cannot fail
-      # the data job (`--ignore-scripts` covers the rest).
+      # The Screener repo is STANDALONE: one package.json + bun.lock. Nothing
+      # from the private desktop monorepo is installed or resolved here.
       - name: Install dependencies
-        run: >-
-          pnpm install --frozen-lockfile --ignore-scripts
-          --filter '@odf/screener-worker...' --filter '.'
+        run: bun install --frozen-lockfile --ignore-scripts
 
-      # Bun strips types when it runs seed.ts, so a contract break in
-      # @odf/shared/screener would otherwise reach the upload instead of failing.
+      # Bun strips types when it runs seed.ts, so a contract break in the
+      # vendored screener contract would otherwise reach the upload instead of
+      # failing.
       - name: Typecheck
-        run: pnpm --filter '@odf/screener-worker' run typecheck
+        run: bun run typecheck
 
       # The pure-logic suites (contract widths/padding, the market sanitizer,
       # the credit roll, the ETL's merge/freshness gates). They need only the
       # installed workspaces, and a broken contract should fail HERE rather
       # than after the R2 upload.
       - name: Unit tests
-        run: bun test packages/shared/src apps/screener-worker/src
+        run: bun test src
+
+      # Safety guard — the daily seed only appends one session. Rebuild any
+      # deleted/truncated history from the exchanges' weekday tables BEFORE the
+      # new session lands; only histories + benchmark are uploaded, then the
+      # daily seed rebuilds the snapshot from them. Holidays/typhoons answer a
+      # valid empty table and are skipped by the backfill, never zero sessions.
+      - name: Fill missing histories (safety guard)
+        timeout-minutes: 35
+        run: bun safety.ts --repair
 
       - name: Run the ETL and upload to R2
         id: seed
-        working-directory: apps/screener-worker
         timeout-minutes: 20
         # seed.ts already retries a partial run ONCE with `--force` internally.
         # The step itself must not go RED: a partial run still uploaded a
@@ -160,7 +155,6 @@ jobs:
         # A PARTIAL run still published a complete grid — the API it serves
         # must be verified too (code 3); only a storage failure (1) skips it.
         if: steps.seed.outputs.code == '0' || steps.seed.outputs.code == '3'
-        working-directory: apps/screener-worker
         timeout-minutes: 5
         run: bun verify.ts
 

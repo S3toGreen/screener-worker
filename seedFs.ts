@@ -24,9 +24,15 @@ import {
   screenerHistoryUrl,
   screenerMarketUrl,
   screenerSnapshotUrl
-} from '@odf/shared/screener'
+} from '@odf/screener-worker/screener'
 import type { ScreenerEnv } from './src/env'
 import { CACHE_VERSION_KEY, DATA_CACHE_CONTROL } from './src/keys'
+import {
+  HISTORY_MANIFEST_KEY,
+  mergeHistoryManifest,
+  readHistoryManifest,
+  type HistoryManifest
+} from './src/manifest'
 
 export const SEED_ROOT = join(import.meta.dir, '.seed-out')
 /** Parallel PUTs: the S3 API takes far more than the wrangler REST path did.
@@ -219,7 +225,7 @@ export function uploadConfigFromEnv(): UploadConfig {
   if (!accessKeyId || !secretAccessKey || !endpoint) {
     throw new Error(
       'R2 S3 credentials missing — set R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and R2_ENDPOINT ' +
-        '(or CLOUDFLARE_ACCOUNT_ID) in the environment / apps/screener-worker/.dev.vars'
+        '(or CLOUDFLARE_ACCOUNT_ID) in the environment / .dev.vars'
     )
   }
   return { bucket, endpoint, accessKeyId, secretAccessKey }
@@ -259,13 +265,40 @@ async function putVersion(client: S3Client, config: UploadConfig): Promise<void>
   }
 }
 
+async function readRemoteManifest(
+  client: S3Client,
+  config: UploadConfig
+): Promise<HistoryManifest | null> {
+  try {
+    const obj = await client.send(
+      new GetObjectCommand({ Bucket: config.bucket, Key: HISTORY_MANIFEST_KEY })
+    )
+    const text = await obj.Body?.transformToString('utf8')
+    if (!text) return null
+    const manifest = readHistoryManifest(JSON.parse(text))
+    if (!manifest) console.log('[upload] remote history manifest unreadable — replacing from local')
+    return manifest
+  } catch (err) {
+    // A genuinely absent object is a first upload; any other read failure keeps
+    // the local entries (the safety guard's per-object fallback covers the rest).
+    if (!isNoSuchKey(err)) {
+      console.log(
+        `[upload] remote history manifest read failed — merging local only: ${String(err)}`
+      )
+    }
+    return null
+  }
+}
+
 export async function uploadSeedRoot(
   config: UploadConfig = uploadConfigFromEnv()
 ): Promise<{ files: number; failed: number }> {
   const files = await seedFiles()
   if (files.length === 0) return { files: 0, failed: 0 }
-  const snapshotPath = files.find((p) => p.endsWith(SCREENER_SNAPSHOT_KEY)) ?? null
-  const rest = snapshotPath === null ? files : files.filter((p) => p !== snapshotPath)
+  const keyOf = (path: string): string => relative(SEED_ROOT, path).split('\\').join('/')
+  const snapshotPath = files.find((p) => keyOf(p) === SCREENER_SNAPSHOT_KEY) ?? null
+  const manifestPath = files.find((p) => keyOf(p) === HISTORY_MANIFEST_KEY) ?? null
+  const rest = files.filter((p) => p !== snapshotPath && p !== manifestPath)
 
   const client = new S3Client({
     region: 'auto',
@@ -318,6 +351,39 @@ export async function uploadSeedRoot(
     )
   }
   await drain(rest)
+  // The ONE history manifest is MERGED with R2, never replaced by a local
+  // partial: a gap repair updates only its targets, and the daily ETL only its
+  // own session's symbols. A missing manifest is a safe empty merge.
+  if (manifestPath !== null) {
+    let local: HistoryManifest | null = null
+    try {
+      local = readHistoryManifest(JSON.parse(await readFile(manifestPath, 'utf8')))
+    } catch (err) {
+      console.log(`[upload] local history manifest unreadable — skipped: ${String(err)}`)
+    }
+    if (local) {
+      const remote = await readRemoteManifest(client, config)
+      const merged = mergeHistoryManifest(remote, local.symbols, Date.now())
+      try {
+        await client.send(
+          new PutObjectCommand({
+            Bucket: config.bucket,
+            Key: HISTORY_MANIFEST_KEY,
+            Body: JSON.stringify(merged),
+            ContentType: 'application/json; charset=utf-8',
+            CacheControl: 'no-store'
+          })
+        )
+        done++
+        console.log(`[upload] history manifest ${Object.keys(merged.symbols).length} symbols`)
+      } catch (err) {
+        // The manifest is an OPTIMIZATION; the histories themselves uploaded.
+        // A private-index failure must never fail the data job (the safety
+        // guard falls back to per-object reads and rebuilds the index).
+        console.log(`[upload] WARN ${HISTORY_MANIFEST_KEY}: ${String(err).slice(0, 300)}`)
+      }
+    }
+  }
   if (snapshotPath !== null) {
     await put(snapshotPath)
     console.log('[upload] snapshot published last')

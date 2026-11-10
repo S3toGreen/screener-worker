@@ -16,7 +16,7 @@ import {
   RISK_NOTICE,
   RISK_PERIODIC,
   RISK_STOP_TRADING
-} from '@odf/shared/screener'
+} from '@odf/screener-worker/screener'
 import {
   changePctOf,
   dateToMs,
@@ -27,8 +27,8 @@ import {
   rawPrice,
   ymToMs,
   type FetchLike
-} from '@odf/shared/httpJson'
-import { dayStampOf } from '@odf/shared/session'
+} from '@odf/screener-worker/httpJson'
+import { dayStampOf } from '@odf/screener-worker/session'
 import { readMembers, readSourcedTable, readTableRows } from './common'
 import {
   sourced,

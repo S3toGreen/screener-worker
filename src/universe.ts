@@ -28,7 +28,7 @@
  * user filtering on 三率/PER/營收 culls ETFs/ETNs without any special case.
  */
 
-import { isFundSymbol } from '@odf/shared/screener'
+import { isFundSymbol } from '@odf/screener-worker/screener'
 
 const STOCK_CODE = /^[1-9][0-9]{3}$/
 

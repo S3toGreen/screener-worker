@@ -3,8 +3,14 @@
  * walk: polite-gated GET → positional rows resolved by field name → one
  * normalized row per symbol (+ optionally the payload's session date).
  */
-import { DAY_MS } from '@odf/shared/session'
-import { dateToMs, getJson, indexer, parseTable, type FetchLike } from '@odf/shared/httpJson'
+import { DAY_MS } from '@odf/screener-worker/session'
+import {
+  dateToMs,
+  getJson,
+  indexer,
+  parseTable,
+  type FetchLike
+} from '@odf/screener-worker/httpJson'
 import { sourced, type Sourced } from './types'
 
 /** The table endpoints are multi-MB payloads from a government host that

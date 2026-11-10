@@ -29,13 +29,13 @@ import {
   screenerMarketUrl,
   screenerSnapshotUrl,
   type ScreenerSnapshot
-} from '@odf/shared/screener'
+} from '@odf/screener-worker/screener'
 import {
   createScreenerService,
   type ScreenerFetch,
   type ScreenerFetchResponse
-} from '@odf/shared/services/screenerService'
-import type { StorageAdapter } from '@odf/shared/services/storage'
+} from '@odf/screener-worker/services/screenerService'
+import type { StorageAdapter } from '@odf/screener-worker/services/storage'
 import { serveApi } from './src/serve'
 import { DATA_CACHE_CONTROL } from './src/keys'
 import type { ScreenerEnv } from './src/env'

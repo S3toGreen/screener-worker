@@ -11,6 +11,10 @@
  * same ones the daily `t187ap17`/`t187ap05` mirrors carry — MINUS the per-symbol
  * query cost.
  *
+ * NOT called by the daily ETL or the backfill (their data contract is the
+ * exchanges' DAILY RWD files only). This reader is retained for a low-frequency
+ * manual fundamental refresh / a future monthly job.
+ *
  * Layout facts (verified live):
  *   · the quarterly table is ONE `hasBorder` table; a row is
  *     公司代號 · 公司名稱 · 營業收入(百萬) · 毛利率 · 營業利益率 · 稅前純益率 · 稅後純益率
@@ -22,7 +26,7 @@
  *   · some cells use an upper-case `<Td …>` tag, so the cell scan is
  *     case-insensitive (a case-sensitive one silently drops that column).
  */
-import { getText, num, postText, type FetchLike } from '@odf/shared/httpJson'
+import { getText, num, postText, type FetchLike } from '@odf/screener-worker/httpJson'
 import { isScreenerSymbol } from '../universe'
 
 const MOPS = 'https://mopsov.twse.com.tw'

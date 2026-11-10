@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import { stampToMs } from '@odf/shared/session'
-import type { FetchLike, HttpResult } from '@odf/shared/httpJson'
+import { stampToMs } from '@odf/screener-worker/session'
+import type { FetchLike, HttpResult } from '@odf/screener-worker/httpJson'
 import { twseDayQuotes, twseDaySblBal } from './history'
 
 /** A fetch double serving one fixed JSON payload. */

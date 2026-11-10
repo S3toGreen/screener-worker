@@ -10,10 +10,14 @@
  * Horizons are TRADING SESSIONS (5 ≈ a week, 20 ≈ a month, 60 ≈ a quarter,
  * 240 ≈ a year), the same index math the row columns use.
  */
-import { returnOver, type BenchmarkSeries, type ScreenerBenchmark } from '@odf/shared/screener'
-import { dayStampOf } from '@odf/shared/session'
-import type { FetchLike } from '@odf/shared/httpJson'
-import { getJson, num, rocToMs } from '@odf/shared/httpJson'
+import {
+  returnOver,
+  type BenchmarkSeries,
+  type ScreenerBenchmark
+} from '@odf/screener-worker/screener'
+import { dayStampOf } from '@odf/screener-worker/session'
+import type { FetchLike } from '@odf/screener-worker/httpJson'
+import { getJson, num, rocToMs } from '@odf/screener-worker/httpJson'
 
 const TWSE_RWD = 'https://www.twse.com.tw/rwd/zh'
 /** The bucket key (the ETL's private state, never served as an API route). */
@@ -48,6 +52,25 @@ export async function twseMonthIndex(dateMs: number, fetchImpl?: FetchLike): Pro
     out.push({ stamp: session, close })
   }
   return out
+}
+
+/** The `count` month-start epochs (Taipei) ending with `sessionDate`'s month,
+ *  ascending. Used to rebuild a missing/short benchmark series from FMTQIK. */
+export function benchmarkMonthStarts(sessionDate: number, count: number): number[] {
+  if (!(sessionDate > 0) || count <= 0) return []
+  const d = new Date(sessionDate + 8 * 3_600_000)
+  let year = d.getUTCFullYear()
+  let month = d.getUTCMonth()
+  const out: number[] = []
+  for (let i = 0; i < count; i++) {
+    out.push(Date.UTC(year, month, 1) - 8 * 3_600_000)
+    month -= 1
+    if (month < 0) {
+      month = 11
+      year -= 1
+    }
+  }
+  return out.reverse()
 }
 
 /** Upserts the month's rows into the stored series (a re-run REPLACES the same

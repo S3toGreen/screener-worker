@@ -18,7 +18,7 @@
  * keeps the ALL-MONTHS aggregate row (`SettlementMonth = 999912`) alone.
  * (TWSE's own 全市場擔保維持率 lives in `twse.ts` — `BFIJ3U_TREND`.)
  */
-import { getRecords, getText, gregToMs, num, type FetchLike } from '@odf/shared/httpJson'
+import { getRecords, getText, gregToMs, num, type FetchLike } from '@odf/screener-worker/httpJson'
 import type {
   MarketDerivatives,
   TaifexContractPosition,
@@ -26,7 +26,7 @@ import type {
   TaifexLargeTrader,
   TaifexOptionSide,
   TaifexPcr
-} from '@odf/shared/screener'
+} from '@odf/screener-worker/screener'
 
 const BASE = 'https://openapi.taifex.com.tw/v1'
 /** The index derivatives the app's screens and the option chain cover. */

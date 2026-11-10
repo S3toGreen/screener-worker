@@ -2,7 +2,7 @@
  * The weekly TDCC 集保 collector (the same shape as `seed.ts`): scrape the
  * per-stock 千張大戶 share, store ONE R2 object, never touch the snapshot.
  *
- *   pnpm --filter @odf/screener-worker run holdings
+ *   bun holdings.ts
  *   bun --env-file=.dev.vars holdings.ts --symbols 2330,0050   # smoke
  *   bun --env-file=.dev.vars holdings.ts --dry-run             # no write
  *
@@ -11,8 +11,8 @@
  * daily run; a missing / stale object simply leaves the cell `–`.
  */
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
-import { SCREENER_CDN_DEFAULT } from '@odf/shared/protocol'
-import { SC, screenerSnapshotUrl } from '@odf/shared/screener'
+import { SCREENER_CDN_DEFAULT } from '@odf/screener-worker/config'
+import { SC, screenerSnapshotUrl } from '@odf/screener-worker/screener'
 import { HOLDINGS_KEY } from './src/keys'
 import { collectHoldings, mergeHoldings } from './src/holdings'
 import { uploadConfigFromEnv } from './seedFs'

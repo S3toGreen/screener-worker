@@ -18,12 +18,23 @@
   "include": [
     "seed.ts",
     "seedFs.ts",
+    "seedMarketHistory.ts",
+    "safety.ts",
     "backfill.ts",
     "holdings.ts",
     "smoke.ts",
     "verify.ts",
+    "src/backfillWindow.test.ts",
+    "src/benchmark.test.ts",
+    "src/credit.test.ts",
     "src/etl.test.ts",
     "src/history.test.ts",
+    "src/historyMerge.test.ts",
+    "src/manifest.test.ts",
+    "src/safety.test.ts",
+    "src/screener.test.ts",
+    "src/services/screenerService.test.ts",
+    "src/sources/taifexHistory.test.ts",
     "worker-configuration.d.ts",
   ]
 }

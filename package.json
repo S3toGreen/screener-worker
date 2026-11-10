@@ -9,18 +9,28 @@
     "cf-typegen": "wrangler types",
     "typecheck": "tsc --noEmit -p tsconfig.worker.json && tsc --noEmit -p tsconfig.seed.json",
     "seed": "bun --env-file=.dev.vars seed.ts",
+    "seed:market-history": "bun --env-file=.dev.vars seedMarketHistory.ts",
+    "safety": "bun --env-file=.dev.vars safety.ts",
     "backfill": "bun --env-file=.dev.vars backfill.ts",
     "holdings": "bun --env-file=.dev.vars holdings.ts",
     "verify": "bun --env-file=.dev.vars verify.ts",
     "smoke": "bun smoke.ts"
   },
-  "dependencies": {
-    "@odf/shared": "workspace:*"
-  },
   "devDependencies": {
     "@aws-sdk/client-s3": "^3.1156.0",
     "@cloudflare/workers-types": "^5.20261019.1",
     "@types/bun": "1.4.3",
-    "wrangler": "^4.151.2"
+    "wrangler": "^4.151.2",
+    "typescript": "^6.0.3"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./screener": "./src/screener.ts",
+    "./session": "./src/session.ts",
+    "./httpJson": "./src/httpJson.ts",
+    "./credit": "./src/credit.ts",
+    "./config": "./src/config.ts",
+    "./services/screenerService": "./src/services/screenerService.ts",
+    "./services/storage": "./src/services/storage.ts"
   }
 }

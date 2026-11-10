@@ -14,8 +14,12 @@
  * ETFs often show "待公告"), `stockRatio` the 無償配股率 (shares per share).
  * Nothing derives from it at capture; the ETL only joins `exDivInDays`.
  */
-import { isDividendsObject, type DividendEvent, type DividendsObject } from '@odf/shared/screener'
-import { DAY_MS } from '@odf/shared/session'
+import {
+  isDividendsObject,
+  type DividendEvent,
+  type DividendsObject
+} from '@odf/screener-worker/screener'
+import { DAY_MS } from '@odf/screener-worker/session'
 import type { ScreenerEnv } from './env'
 import { DIVIDENDS_KEY } from './keys'
 
