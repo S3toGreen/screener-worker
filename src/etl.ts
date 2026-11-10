@@ -1077,9 +1077,9 @@ async function saveCreditState(
  *  exchange publishes a per-stock loan amount, so the shares' cost basis can
  *  only come from the rolling estimate (`estMaintenanceRatio`). */
 const MAINTENANCE_NOTE =
-  '上市櫃融資維持率 (est.) — Σ(margin balance lots × 10 × close) ÷ (TWSE 融資金額 + TPEx 融資餘額); financed value (ETFs included) over the announced loan balance — more price-sensitive than 全市場擔保維持率'
+  '上市櫃融資維持率 (est.) — Σ(融資餘額（交易單位）× 1,000 × 每股收盤價) ÷ (TWSE 融資金額 + TPEx 融資餘額); financed value (ETFs included) over the announced loan balance — more price-sensitive than 全市場擔保維持率'
 const MAINTENANCE_NOTE_TWSE =
-  'TWSE 融資維持率 (est.) — Σ(margin balance lots × 10 × close) ÷ 融資金額 (ETFs included); the TPEx half was unavailable'
+  'TWSE 融資維持率 (est.) — Σ(融資餘額（交易單位）× 1,000 × 每股收盤價) ÷ 融資金額 (ETFs included); the TPEx half was unavailable'
 
 /** One market's row sums for the combined credit measures. */
 interface MarketSums {

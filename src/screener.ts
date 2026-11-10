@@ -331,7 +331,7 @@ export interface ScreenerBenchmark {
  *  the Σ of its per-stock balance table (the only lot totals it offers).
  *
  *  `maintenanceRatio` is OUR estimate of the 上市櫃 融資維持率:
- *      Σ(margin balance lots × 10 × close) ÷ (TWSE 融資金額 + TPEx 融資餘額)
+ *      Σ(margin balance lots × 1,000 shares × close) ÷ (TWSE 融資金額 + TPEx 融資餘額)
  *  — i.e. the financed market value (ETFs included) over the announced loan
  *  balance. The exchanges' announced balances include ETFs too. `scope` names
  *  the markets both halves actually covered (a missing TPEx summary falls back
