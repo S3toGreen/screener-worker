@@ -1,8 +1,9 @@
 /**
  * TAIFEX context readers — the daily derivatives aggregates the screener's
- * Market Overview consumes. Latest-only BY DESIGN: these are published once
- * per session and nothing in the app needs their history, so no object is
- * persisted beyond the snapshot that carries them.
+ * Market Overview consumes. The ETL now retains a rolling observation series
+ * of these daily snapshots so the panel can show changes and a trend. The
+ * exchange publishes one session at a time; the readers themselves stay
+ * per-session and never invent a prior value.
  *
  * PAYLOAD SHAPE FLIPS: the exchange serves some of these as JSON and others as
  * CSV (the general institutional table answered CSV even with

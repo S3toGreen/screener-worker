@@ -12,8 +12,10 @@ import {
   anchorDaily,
   buildMarketContext,
   buildRow,
+  lateRepairWindow,
   mergeSession,
   perDateFirst,
+  preserveRowCells,
   probeDays,
   readSafe,
   vwapOf,
@@ -237,6 +239,43 @@ describe('buildMarketContext — the separate market object', () => {
     expect(ctx?.credit?.officialMaintenanceRatio).toBeNull()
   })
 
+  test('a stale TPEx summary is never joined to the anchor', () => {
+    const stale = tpexSummary({ dateMs: session - 86_400_000 })
+    const ctx = buildMarketContext(
+      summary(),
+      stale,
+      official,
+      null,
+      [row('TWSE'), row('TPEX')],
+      session
+    )
+    expect(ctx?.credit?.scope).toBe('TWSE')
+    // No OTC loan, credit amount or market cap from the prior session.
+    expect(ctx?.credit?.tpexMarginBalanceNtd).toBeNull()
+    expect(ctx?.credit?.tpexCreditAmountNtd).toBeNull()
+    expect(ctx?.credit?.tpexMarketCapNtd).toBeNull()
+    expect(ctx?.credit?.financedValueNtd).toBe(100_000_000)
+  })
+
+  test('a carried market never enters the anchored credit aggregate', () => {
+    const ctx = buildMarketContext(
+      summary(),
+      tpexSummary(),
+      official,
+      null,
+      [row('TWSE'), row('TPEX')],
+      session,
+      null,
+      ['TPEX']
+    )
+    // The stale TPEx row's financed value/cap is excluded even though its
+    // summary is current.
+    expect(ctx?.credit?.scope).toBe('TWSE')
+    expect(ctx?.credit?.financedValueNtd).toBe(100_000_000)
+    expect(ctx?.credit?.marketCapNtd).toBe(10_000_000)
+    expect(ctx?.credit?.maintenanceRatio).toBeCloseTo(200, 6)
+  })
+
   test('the 上市+上櫃 ratio joins the announced loan balances', () => {
     const ctx = buildMarketContext(
       summary(),
@@ -254,8 +293,8 @@ describe('buildMarketContext — the separate market object', () => {
     expect(ctx?.credit?.tpexMarginBalanceLots).toBe(100)
     expect(ctx?.credit?.tpexShortBalanceLots).toBe(10)
     expect(ctx?.credit?.tpexMarginBalanceNtd).toBe(20_000_000)
-    expect(ctx?.credit?.marketCapNtd).toBe(15_000_000)
-    expect(ctx?.credit?.marginToMarketCap).toBeCloseTo((70 / 15) * 100, 6)
+    expect(ctx?.credit?.marketCapNtd).toBe(11_000_000)
+    expect(ctx?.credit?.marginToMarketCap).toBeCloseTo((70 / 11) * 100, 6)
   })
 
   test('without the TPEx money summary the ratio stays TWSE-only', () => {
@@ -305,6 +344,33 @@ describe('buildMarketContext — the separate market object', () => {
 })
 
 type ScreenerFieldKey = (typeof SCREENER_FIELDS)[number]
+
+describe('lateRepairWindow — the evening catch-up', () => {
+  const session = stampToMs('20261104')
+
+  test('same session at/after 20:00 Taipei is a repair pass', () => {
+    // 22:00 Taipei.
+    expect(lateRepairWindow(Date.UTC(2026, 10, 4, 14), session)).toBe(true)
+  })
+
+  test('earlier the same day, or the next day, is not', () => {
+    // 18:00 Taipei (first run).
+    expect(lateRepairWindow(Date.UTC(2026, 10, 4, 10), session)).toBe(false)
+    // 03:45 Taipei the NEXT day IS the second repair slot.
+    expect(lateRepairWindow(Date.UTC(2026, 10, 4, 19, 45), session)).toBe(true)
+    // 03:45 two days later is outside the session's fast-path window.
+    expect(lateRepairWindow(Date.UTC(2026, 10, 5, 19, 45), session)).toBe(false)
+    expect(lateRepairWindow(0, session)).toBe(false)
+  })
+})
+
+describe('preserveRowCells — same-session re-run safety', () => {
+  test('fills only null/empty cells; finite/new values win', () => {
+    const next = [null, '', 0, 5, 'new', null] as ScreenerRow
+    const prior = ['old', 'prior', 3, null, 'old', 'kept'] as ScreenerRow
+    expect(preserveRowCells(next, prior)).toEqual(['old', 'prior', 0, 5, 'new', 'kept'])
+  })
+})
 
 describe('probeDays — the rwd anchor walk', () => {
   test('today first, weekends skipped, the newest five weekdays', () => {
@@ -634,6 +700,27 @@ describe('buildRow — a same-stamp re-run keeps the KNOWN cells', () => {
     bigHolder4w: null,
     exDiv: null,
     listed: '19940905'
+  })
+
+  test('the row is exactly the contract width and identity order', () => {
+    const h = emptyHistory()
+    mergeSession(h, '20261104', values({ close: 100_000 }), { preserved: 0 })
+    const row = buildRow(seed(), h, '20261104')
+    expect(row.length).toBe(SCREENER_FIELDS.length)
+    expect(row[SC.symbol]).toBe('2330')
+    expect(row[SC.name]).toBe('台積電')
+    expect(row[SC.market]).toBe('TWSE')
+  })
+
+  test('a missing trust-flow session does not reset the streak', () => {
+    const h = emptyHistory()
+    mergeSession(h, '20261101', values({ trust: 10 }), { preserved: 0 })
+    mergeSession(h, '20261102', values({ trust: 20 }), { preserved: 0 })
+    mergeSession(h, '20261103', values({ trust: null }), { preserved: 0 })
+    const row = buildRow(seed(), h, '20261104')
+    // The newest published trust flows are 20 and 10; the null session is a
+    // gap, not a zero.
+    expect(row[SC.instTrustStreak]).toBe(2)
   })
 
   test('the history cell fills a source that failed THIS pass', () => {

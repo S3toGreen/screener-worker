@@ -6,8 +6,8 @@
  * morning; they are only dated fallbacks) → fetch every official source
  * (per-date first, mirror second; a failure leaves its columns null, never a
  * previous session's value) → filter to the stock universe (`^[1-9][0-9]{3}$`) →
- * per symbol, append today's session to ITS 260-session history object and
- * derive the 52-column row from the rolling window → PUT the histories, then
+ * per symbol, append today's session to ITS 780-session history object and
+ * derive the 73-column row from the rolling window → PUT the histories, then
  * the snapshot LAST (a half-written run never publishes a grid whose history
  * is missing).
  *
@@ -25,6 +25,9 @@ import {
   SCREENER_SNAPSHOT_KEY,
   instDeltaRatio,
   isScreenerHistory,
+  mergeMarketContext,
+  mergeMarketHistory,
+  readMarketContext,
   returnOver,
   screenNum,
   type DividendsObject,
@@ -129,6 +132,12 @@ const ROLL_TOD_MS = 15 * 3_600_000
  *  market falls back to the carried rows exactly like a stale session. */
 const TWSE_DAILY_MIN_ROWS = 900
 const TPEX_DAILY_MIN_ROWS = 700
+/** A listing universe below these row counts is a truncated payload, not a
+ *  quiet market. Keep the daily rows (their own identity/name) instead of
+ *  rejecting every symbol the truncated universe omits. The counts sit below
+ *  the normal universes (~1 300 TWSE / ~800 TPEx) and above a partial page. */
+const TWSE_UNIVERSE_MIN_ROWS = 900
+const TPEX_UNIVERSE_MIN_ROWS = 500
 /** The 營益分析 mirror is regenerated on every filing batch, so its 出表日期 is
  *  (near) the run day — a stamp further than this from the anchor means the
  *  feed stopped and the values may predate a quarterly publish. */
@@ -141,6 +150,13 @@ const SESSION_FINAL_TOD_MS = STOCK_CLOSE_TOD_MS + 30 * 60_000
 /** The most missed sessions a daily run repairs from the per-date tables —
  *  a longer outage needs the 3-year backfill (logged + `partial`). */
 const CATCHUP_MAX = 10
+/** The evening catch-up boundary (Taipei): a same-session run after this hour
+ *  is a REPAIR pass, not the morning guard. It re-reads every source so a
+ *  source that published late (day-trade, credit, TAIFEX, a regenerated file)
+ *  is merged, while the byte guards keep every unchanged write a no-op. */
+const LATE_REPAIR_TOD_MS = 20 * 3_600_000
+/** The next-morning guard (Taipei 03:45) that repairs a still-late session. */
+const MORNING_GUARD_TOD_MS = 3 * 3_600_000 + 45 * 60_000
 /** Weekdays the anchor discovery walks back from today (a long weekend plus a
  *  holiday). The first date ANY market answers is the anchor. */
 const PROBE_MAX_DAYS = 5
@@ -217,10 +233,16 @@ export async function runEtl(
   const degraded = new Set<string>()
   const late = new Set<string>()
   const { snap: prev, text: prevText } = await readSnapshot(env)
+  // The evening catch-up is a REPAIR pass on the same session: the stock grid
+  // is current, but sources that published after the first run (day-trade,
+  // credit, TAIFEX, a regenerated table) must still be merged. Treat it as a
+  // local force of the same session only — never a payload-behind override.
+  const repair = prev !== null && lateRepairWindow(nowMs, prev.sessionDate)
+  if (repair) console.log('[etl] evening repair window — re-reading every source')
 
   // Fast path — no request at all: the stored session is the latest the
   // exchanges can have published (its next day's 15:00 has not passed yet).
-  if (!force && prev && nowMs < prev.sessionDate + DAY_MS + ROLL_TOD_MS) {
+  if (!force && !repair && prev && nowMs < prev.sessionDate + DAY_MS + ROLL_TOD_MS) {
     return finish(
       prev.sessionDate,
       prev.rows.length,
@@ -306,8 +328,8 @@ export async function runEtl(
   }
   // `force` bypasses the remaining freshness gate — the workflow's partial
   // retry and the backfill's same-stamp re-run exist precisely to redo today's
-  // session.
-  if (!force && prev && sessionDate <= prev.sessionDate) {
+  // session. The evening repair bypasses ONLY this same-session gate.
+  if (!force && !repair && prev && sessionDate <= prev.sessionDate) {
     return finish(sessionDate, prev.rows.length, true, 'no new session, skip', degraded, late)
   }
 
@@ -447,6 +469,21 @@ export async function runEtl(
       dayTrade: tpexDayTrades
     }
   }
+  // A universe read can answer a valid-shaped but truncated page. It is only
+  // the identity/name gate — fall back to the daily table's own identity for
+  // every row instead of dropping the symbols the truncated page omitted.
+  for (const market of MARKETS) {
+    const src = sources[market]
+    const min = market === 'TWSE' ? TWSE_UNIVERSE_MIN_ROWS : TPEX_UNIVERSE_MIN_ROWS
+    if (src.universe && src.universe.data.size < min) {
+      console.log(
+        `[etl] ${market} universe truncated (${src.universe.data.size} rows < ${min}) — ` +
+          'daily identity fallback'
+      )
+      src.universe = null
+      degraded.add(`universe:${market.toLowerCase()}`)
+    }
+  }
   if (late.size > 0) console.log(`[etl] sources late: ${[...late].join(' ')}`)
   if (degraded.size > 0) console.log(`[etl] sources failed: ${[...degraded].join(' ')}`)
 
@@ -483,7 +520,14 @@ export async function runEtl(
   const seeds: Seed[] = []
   for (const market of MARKETS) {
     const src = sources[market]
-    if (!src.daily) continue
+    if (!src.daily) {
+      // No daily at all is a carried market too: its prior rows are merged
+      // into the grid, so its rows must never enter the anchor's credit sums.
+      console.log(`[etl] ${market} daily unavailable — carried, credit excluded`)
+      stale.push(market)
+      degraded.add(`carried:${market.toLowerCase()}`)
+      continue
+    }
     const minRows = market === 'TWSE' ? TWSE_DAILY_MIN_ROWS : TPEX_DAILY_MIN_ROWS
     if (src.daily.dateMs !== sessionDate || src.daily.rows < minRows) {
       if (src.daily.dateMs === sessionDate) {
@@ -578,7 +622,7 @@ export async function runEtl(
   // persisted in its own small object — no per-session history is kept. The
   // roll needs the symbol's HISTORY (the cold-start VWAP prior), so it runs
   // inside the per-symbol task below; the state is written once afterwards.
-  const credit = await openCreditState(env, stamp, degraded)
+  const credit = await openCreditState(env, degraded)
 
   // A missed run leaves a GAP: the stored session is older than the anchor and
   // nothing else would ever append those sessions. Repair them from the
@@ -600,6 +644,9 @@ export async function runEtl(
 
   /** Same-session re-run outcomes: cells kept because this run's source was
    *  absent, and symbols whose history was byte-identical (no write). */
+  const sameSession = prev !== null && prev.sessionDate === sessionDate
+  const prevRows = new Map<string, ScreenerRow>()
+  for (const row of prev?.rows ?? []) prevRows.set(String(row[SC.symbol]), row)
   const stats = { preserved: 0, unchanged: 0 }
   const chains: SeedChain[] = seeds.map((seed) => ({ seed, gap: gaps.get(seed.symbol) ?? [] }))
   const fresh = await mapLimit(chains, R2_CONCURRENCY, async (entry): Promise<SeedOutcome> => {
@@ -622,6 +669,13 @@ export async function runEtl(
     const merged = appendSession(history, seed.symbol, stamp, seed, stats)
     rollSeedMarginCost(seed, merged, credit, stamp)
     const row = buildRow(seed, merged, stamp)
+    // A same-session re-run may have lost a live source (a late/regenerated
+    // reader failed this pass). The earlier row is the SAME session's published
+    // truth, so fill only its null/empty cells; new finite values always win.
+    if (sameSession) {
+      const priorRow = prevRows.get(seed.symbol)
+      if (priorRow) preserveRowCells(row, priorRow)
+    }
     const body = JSON.stringify(merged)
     // A guard run re-appends the SAME session: when the serialized bytes match
     // the stored object, NOTHING is written. That makes the 03:45 guard a
@@ -661,10 +715,13 @@ export async function runEtl(
   // whose history read or write failed. Merge order: carried markets first,
   // then per-seed outcomes (a failure overrides back to its previous row, or
   // to a daily-only row for a symbol the previous snapshot never held).
-  const prevRows = new Map<string, ScreenerRow>()
-  for (const row of prev?.rows ?? []) prevRows.set(String(row[SC.symbol]), row)
-
   const rowsBySymbol = new Map<string, ScreenerRow>()
+  // A same-session repair may have a truncated daily table/universe: symbols
+  // absent from this run's seeds still belong to the session. Seed from the
+  // published grid first; the fresh rows below overwrite their symbols.
+  if (sameSession) {
+    for (const [symbol, row] of prevRows) rowsBySymbol.set(symbol, row)
+  }
   const carried: Market[] = [...stale]
   for (const market of MARKETS) {
     if (sources[market].daily && !stale.includes(market)) continue
@@ -697,30 +754,42 @@ export async function runEtl(
   let benchmark: ScreenerSnapshot['benchmark'] = null
   try {
     let prior = null as ReturnType<typeof mergeBenchmark> | null
+    let priorText: string | null = null
     const stored = await withRetry('benchmark read', 3, () => env.R2_BUCKET.get(BENCHMARK_KEY))
     if (stored) {
-      const raw = await stored.json()
-      if (shapedBenchmark(raw)) prior = raw
+      priorText = await stored.text()
+      try {
+        const raw = JSON.parse(priorText) as unknown
+        if (shapedBenchmark(raw)) prior = raw
+      } catch {
+        priorText = null
+      }
     }
     const month = await twseMonthIndex(sessionDate).catch(() => [])
     if (month.length === 0) console.log(`[etl] benchmark month unavailable for ${stamp}`)
     const series = mergeBenchmark(prior, month)
     benchmark = benchmarkReturns(series)
-    await withRetry('benchmark put', 3, () =>
-      env.R2_BUCKET.put(BENCHMARK_KEY, JSON.stringify(series), {
-        httpMetadata: {
-          contentType: 'application/json; charset=utf-8',
-          cacheControl: DATA_CACHE_CONTROL
-        }
-      })
-    )
+    const body = JSON.stringify(series)
+    if (priorText === body) {
+      console.log('[etl] benchmark unchanged — not rewritten')
+    } else {
+      await withRetry('benchmark put', 3, () =>
+        env.R2_BUCKET.put(BENCHMARK_KEY, body, {
+          httpMetadata: {
+            contentType: 'application/json; charset=utf-8',
+            cacheControl: DATA_CACHE_CONTROL
+          }
+        })
+      )
+    }
   } catch (err) {
     console.log(`[etl] benchmark unavailable: ${String(err)}`)
   }
 
-  // Market-wide context (latest only; both halves independently nullable). It
-  // is its OWN object — the stock grid stays per-stock rows only. Published
-  // before the snapshot so the grid never points at a missing context.
+  // Market-wide context (own object; both halves independently nullable). It
+  // is published before the snapshot so the grid never points at a missing
+  // context. The rolling history is appended here — one observation per
+  // session, same-session re-runs merge without erasing a published cell.
   const market = buildMarketContext(
     creditSummary,
     tpexSummary,
@@ -728,22 +797,55 @@ export async function runEtl(
     derivatives,
     rows,
     sessionDate,
-    tpexTotals
+    tpexTotals,
+    stale
   )
   if (market) {
-    const body = JSON.stringify(market)
-    const prior = await env.R2_BUCKET.get(SCREENER_MARKET_KEY).catch(() => null)
-    if (prior && (await prior.text()) === body) {
-      console.log('[etl] market context unchanged — not rewritten')
-    } else {
-      await withRetry('market put', 3, () =>
-        env.R2_BUCKET.put(SCREENER_MARKET_KEY, body, {
-          httpMetadata: {
-            contentType: 'application/json; charset=utf-8',
-            cacheControl: DATA_CACHE_CONTROL
-          }
-        })
+    let priorText: string | null = null
+    let priorReady = true
+    try {
+      const priorObj = await withRetry('market read', 3, () =>
+        env.R2_BUCKET.get(SCREENER_MARKET_KEY)
       )
+      if (priorObj) priorText = await withRetry('market text', 3, () => priorObj.text())
+    } catch (err) {
+      // A failed READ is not absence: the prior object (and its history) is
+      // still the only truth. Leave it untouched; the next run retries.
+      priorReady = false
+      degraded.add('market-read')
+      console.log(`[etl] market context read failed — prior object left untouched: ${String(err)}`)
+    }
+    let priorContext: MarketContext | null = null
+    if (priorReady && priorText) {
+      try {
+        priorContext = readMarketContext(JSON.parse(priorText))
+      } catch (err) {
+        // A truncated/corrupt body is never a licence to erase the rolling
+        // series; retry the read on the next run.
+        priorReady = false
+        degraded.add('market-corrupt')
+        console.log(`[etl] market context unreadable — prior object left untouched: ${String(err)}`)
+      }
+    }
+    if (priorReady) {
+      const merged =
+        priorContext && priorContext.asOf === market.asOf
+          ? mergeMarketContext(priorContext, market)
+          : market
+      merged.history = mergeMarketHistory(priorContext?.history, merged, priorContext)
+      const body = JSON.stringify(merged)
+      if (priorText === body) {
+        console.log('[etl] market context unchanged — not rewritten')
+      } else {
+        await withRetry('market put', 3, () =>
+          env.R2_BUCKET.put(SCREENER_MARKET_KEY, body, {
+            httpMetadata: {
+              contentType: 'application/json; charset=utf-8',
+              cacheControl: DATA_CACHE_CONTROL
+            }
+          })
+        )
+      }
     }
   }
   // The publication itself retries: every history PUT above already landed,
@@ -775,6 +877,23 @@ export async function runEtl(
   )
 }
 
+/** Whether a run at `nowMs` is the same session's evening repair pass. A
+ *  complete first run leaves no stale cache; this pass still re-reads the
+ *  sources so late-published data is never skipped for the day. */
+export function lateRepairWindow(nowMs: number, sessionDateMs: number): boolean {
+  if (!(nowMs > 0) || !(sessionDateMs > 0)) return false
+  const evening =
+    dayStampOf(nowMs) === dayStampOf(sessionDateMs) && todOf(nowMs) >= LATE_REPAIR_TOD_MS
+  // The next-morning 03:45 guard is the second repair slot; it must not wait
+  // for the next session's first run. Only inside the fast-path window —
+  // after 15:00 the next session's own run takes over.
+  const morning =
+    dayStampOf(nowMs) === dayStampOf(sessionDateMs + DAY_MS) &&
+    todOf(nowMs) >= MORNING_GUARD_TOD_MS &&
+    nowMs < sessionDateMs + DAY_MS + ROLL_TOD_MS
+  return evening || morning
+}
+
 /** The result line every path logs — one shape, greppable in `wrangler tail`. */
 
 /** Sessions the cold-start margin cost averages over (Σ成交金額 ÷ Σ成交股數). */
@@ -804,8 +923,6 @@ export function vwapOf(h: ScreenerHistory, sessions: number): number | null {
 /** The shared credit-state handle: read ONCE, rolled per symbol, written once. */
 interface CreditStateSession {
   state: CreditStateFile
-  /** True when this run's session is newer than the stored one (roll it). */
-  advance: boolean
   rolled: number
   resets: number
 }
@@ -814,7 +931,6 @@ interface CreditStateSession {
  *  empty one — the symbols re-initialize from their warm priors). */
 async function openCreditState(
   env: ScreenerEnv,
-  stamp: string,
   degraded: Set<string>
 ): Promise<CreditStateSession> {
   let state: CreditStateFile = { version: MARGIN_COST_STATE_VERSION, asOf: '', symbols: {} }
@@ -827,27 +943,35 @@ async function openCreditState(
     console.log(`[etl] credit state unreadable — estimates re-initialize: ${String(err)}`)
     degraded.add('credit-state')
   }
-  return { state, advance: state.asOf < stamp, rolled: 0, resets: 0 }
+  return { state, rolled: 0, resets: 0 }
 }
 
-/** ONE symbol's roll for this session (mutates the shared state + the seed). */
+/** ONE symbol's roll for this session (mutates the shared state + the seed).
+ *  The gate is PER SYMBOL: the first run of a session can miss a late margin
+ *  source, and the evening repair must still roll the symbols it missed. A
+ *  global `state.asOf` gate could never do that. */
 function rollSeedMarginCost(
   seed: Seed,
   merged: ScreenerHistory,
   credit: CreditStateSession,
   stamp: string
 ): void {
-  if (!credit.advance) {
-    const entry = credit.state.symbols[seed.symbol]
-    // A close-initialized cost stays unpublished on a re-run too.
-    seed.marginCost = entry && entry.asOf === stamp && entry.warm !== false ? entry.cost : null
+  const entry = credit.state.symbols[seed.symbol]
+  if (entry && entry.asOf === stamp) {
+    // Already rolled this session (a repair): reuse the same estimate.
+    seed.marginCost = entry.warm !== false ? entry.cost : null
+    return
+  }
+  // Never roll a back-dated repair onto a newer persisted estimate.
+  if (entry && entry.asOf > stamp) {
+    seed.marginCost = null
     return
   }
   const m = seed.margin
   const closeNtd = seed.daily.close > 0 ? seed.daily.close / 100 : 0
   if (!m || !(closeNtd > 0)) return
   const next = rollAverageMarginCost(
-    credit.state.symbols[seed.symbol] ?? null,
+    entry ?? null,
     {
       prevBal: m.marginPrev,
       buy: m.marginBuy,
@@ -875,7 +999,9 @@ async function saveCreditState(
   stamp: string,
   degraded: Set<string>
 ): Promise<void> {
-  if (!credit.advance) return
+  // No symbol rolled => nothing changed; do NOT advance the state's date, or
+  // a later same-session repair would believe the session was already done.
+  if (credit.rolled === 0) return
   credit.state.asOf = stamp
   try {
     await withRetry('credit state put', 3, () =>
@@ -1026,27 +1152,34 @@ export function buildMarketContext(
   derivatives: MarketDerivatives | null,
   rows: ScreenerRow[],
   sessionDate: number,
-  tpexTotals: MarginTotals | null = null
+  tpexTotals: MarginTotals | null = null,
+  /** Markets whose daily payload was carried: their rows are the PRIOR
+   *  session's, so they must not enter this session's financed value, market
+   *  cap or ratio. */
+  staleMarkets: readonly ('TWSE' | 'TPEX')[] = []
 ): MarketContext | null {
   let credit: MarketCredit | null = null
   if (summary && summary.dateMs === sessionDate) {
-    const twse = sumRows(rows, 'TWSE')
-    const tpex = sumRows(rows, 'TPEX')
+    // The OTC summary is from the same session or it is not used at all: a
+    // stale dashboard must never be stamped as the anchor's credit.
+    const tpexCurrent = tpexSummary?.dateMs === sessionDate ? tpexSummary : null
+    const twse = staleMarkets.includes('TWSE') ? emptySums() : sumRows(rows, 'TWSE')
+    const tpex = staleMarkets.includes('TPEX') ? emptySums() : sumRows(rows, 'TPEX')
     const loanTwse = summaryNum(summary.marginAmountNtd)
-    const loanTpex = tpexSummary?.marginBalanceNtd ?? null
+    const loanTpex = tpexCurrent?.marginBalanceNtd ?? null
     // TPEx joins the ratio only when BOTH halves are present: its announced
     // loan balance and its row value. A numerator without a denominator (or
     // the reverse) would bias the ratio — the scope names what was covered.
     const scope: MarketCredit['scope'] =
-      tpex.hasFinanced && loanTpex !== null && loanTpex > 0 && loanTwse !== null
+      twse.hasFinanced && tpex.hasFinanced && loanTpex !== null && loanTpex > 0 && loanTwse !== null
         ? 'TWSE+TPEX'
         : 'TWSE'
     const financed = scope === 'TWSE+TPEX' ? twse.financedNtd + tpex.financedNtd : twse.financedNtd
     const loan = scope === 'TWSE+TPEX' ? (loanTwse ?? 0) + (loanTpex ?? 0) : loanTwse
-    const cap =
-      scope === 'TWSE+TPEX' && tpexSummary
-        ? twse.marketCapNtd + tpexSummary.marketCapNtd
-        : twse.marketCapNtd
+    // The market cap denominator uses the SAME row universe as `financed`:
+    // the grid's rows for both markets. The OTC dashboard's whole-market cap
+    // (which includes funds) is carried separately and is not mixed in.
+    const cap = scope === 'TWSE+TPEX' ? twse.marketCapNtd + tpex.marketCapNtd : twse.marketCapNtd
     credit = {
       scope,
       sessionDate,
@@ -1090,8 +1223,8 @@ export function buildMarketContext(
       tpexShortPrevLots: tpexTotals ? tpexTotals.shortPrev : null,
       tpexShortChangeLots: tpexTotals ? tpexTotals.shortBal - tpexTotals.shortPrev : null,
       tpexMarginBalanceNtd: loanTpex,
-      tpexCreditAmountNtd: tpexSummary?.creditAmountNtd ?? null,
-      tpexMarketCapNtd: tpexSummary?.marketCapNtd ?? null,
+      tpexCreditAmountNtd: tpexCurrent?.creditAmountNtd ?? null,
+      tpexMarketCapNtd: tpexCurrent?.marketCapNtd ?? null,
       // A value the panel divides by: never 0 for a missing half.
       financedValueNtd: financed > 0 ? financed : null,
       loanBalanceNtd: loan !== null && loan > 0 ? loan : null,
@@ -1722,7 +1855,10 @@ function appendSession(
     revenueYoy: finiteOrNull(seed.revenue?.revenueYoy),
     revenueCumYoy: finiteOrNull(seed.revenue?.revenueCumYoy),
     revenueMonth: finiteOrNull(seed.revenue?.revenueMonth),
-    revenueYm: seed.revenue?.monthMs ? Number(dayStampOf(seed.revenue.monthMs).slice(0, 6)) : null,
+    revenueYm:
+      seed.revenue?.monthMs && seed.revenue.monthMs > 0
+        ? Number(dayStampOf(seed.revenue.monthMs).slice(0, 6)) || null
+        : null,
     foreignShares: finiteOrNull(seed.foreign?.shares),
     foreignRatio: finiteOrNull(seed.foreign?.ratio),
     dayTradeShares: finiteOrNull(seed.dayTrade)
@@ -1804,20 +1940,29 @@ async function refreshDividends(
   })
   if (fresh.length === 0 && !prior) return null
   const merged = mergeDividends(prior, fresh, sessionDate)
+  // `mergeDividends` stamps updatedAt=now; keep the prior stamp when the
+  // event set is unchanged so the object's bytes (and its R2 write) are a
+  // no-op on a repeat run.
+  const eventsUnchanged =
+    prior !== null && JSON.stringify(merged.events) === JSON.stringify(prior.events)
+  const next =
+    eventsUnchanged && prior !== null ? { ...merged, updatedAt: prior.updatedAt } : merged
   try {
-    await env.R2_BUCKET.put(DIVIDENDS_KEY, JSON.stringify(merged), {
-      httpMetadata: {
-        contentType: 'application/json; charset=utf-8',
-        cacheControl: DATA_CACHE_CONTROL
-      }
-    })
+    if (prior === null || JSON.stringify(next) !== JSON.stringify(prior)) {
+      await env.R2_BUCKET.put(DIVIDENDS_KEY, JSON.stringify(next), {
+        httpMetadata: {
+          contentType: 'application/json; charset=utf-8',
+          cacheControl: DATA_CACHE_CONTROL
+        }
+      })
+    }
   } catch (err) {
     console.log(`[etl] dividends calendar write failed: ${String(err).slice(0, 120)}`)
   }
-  return merged
+  return next
 }
 
-/** The 59-column row: today's payloads + the rolling window of `history`. */
+/** The 73-column row: today's payloads + the rolling window of `history`. */
 /** The newest NON-NULL value of a QUARTERLY history column. The exchange's
  *  quarterly tables publish in WAVES (`t187ap17_L` holds only the newest
  *  filing batch — ~46 rows while the Q3 season runs), so a company that has
@@ -1831,6 +1976,17 @@ function lastPublished(
   if (!Array.isArray(arr)) return null
   for (let i = arr.length - 1; i >= 0; i--) if (arr[i] !== null) return arr[i]
   return null
+}
+
+/** Fills a same-session re-run's null/empty cells from the row already
+ *  published for that session. The new row's finite values always win. */
+export function preserveRowCells(next: ScreenerRow, prior: ScreenerRow): ScreenerRow {
+  for (let i = 0; i < next.length && i < prior.length; i++) {
+    const cur = next[i]
+    const old = prior[i]
+    if ((cur === null || cur === '') && old !== null && old !== '') next[i] = old
+  }
+  return next
 }
 
 export function buildRow(seed: Seed, h: ScreenerHistory, stamp: string): ScreenerRow {
@@ -1873,13 +2029,12 @@ export function buildRow(seed: Seed, h: ScreenerHistory, stamp: string): Screene
   // the 5-session accumulations alike.
   let trustStreak: number | null = null
   for (let i = last; i >= 0; i--) {
-    const f = h.foreign[i]
     const t = h.trust[i]
-    const d = h.dealer[i]
-    if (f === null && t === null && d === null) continue
-    if (t !== null && t > 0) {
-      trustStreak = (trustStreak ?? 0) + 1
-    } else {
+    // A session with no published trust flow is NOT a zero-flow day: skip it
+    // so an outage cannot reset a genuine buying streak to 0.
+    if (t === null) continue
+    if (t > 0) trustStreak = (trustStreak ?? 0) + 1
+    else {
       trustStreak ??= 0
       break
     }

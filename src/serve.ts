@@ -1,7 +1,7 @@
 /**
  * The public data API — five cached reads over the bucket the ETL owns.
  *
- *   GET /api/snapshot          → the day's 72-column STOCK grid (`screener-latest.json`)
+ *   GET /api/snapshot          → the day's 73-column STOCK grid (`screener-latest.json`)
  *   GET /api/market            → the market-wide credit/derivatives object
  *   GET /api/history/{symbol}  → that symbol's rolling history (on demand only)
  *   GET /api/holdings          → the weekly TDCC 集保 object (`holdings.json`)
@@ -59,8 +59,9 @@ export interface Background {
  *  change must never be served from an older entry). v7 = the 61-column
  *  snapshot; v8 = 72 columns + the `market` block inside the snapshot;
  *  v9 = the market context split into its own `/api/market`; v10 = the
- *  official maintenance ratio (BFIJ3U) and no 融資金額 family. */
-const CACHE_VERSION = '11'
+ *  official maintenance ratio (BFIJ3U) and no 融資金額 family; v11 = the
+ *  73-column credit-trading extension; v12 = the rolling market history. */
+const CACHE_VERSION = '12'
 
 /** One R2 read per minute per isolate — the stamp only moves once a session. */
 const VERSION_TTL_MS = 60_000
