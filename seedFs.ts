@@ -313,7 +313,11 @@ export async function uploadSeedRoot(
 
   let done = 0
   let failed = 0
-  const put = async (path: string): Promise<void> => {
+  let historyFailed = 0
+  /** Any non-history object (snapshot/market/holdings/benchmark) that made it
+   *  successfully — its edge entry keys on the publication stamp. */
+  let nonHistoryDone = 0
+  const put = async (path: string): Promise<boolean> => {
     const key = relative(SEED_ROOT, path).split('\\').join('/')
     const body = await readFile(path)
     for (let attempt = 1; attempt <= 4; attempt++) {
@@ -328,19 +332,22 @@ export async function uploadSeedRoot(
           })
         )
         done++
+        if (!key.startsWith('history/')) nonHistoryDone++
         if (done % 250 === 0) console.log(`[upload] ${done}/${files.length} (failed ${failed})`)
-        return
+        return true
       } catch (err) {
         if (attempt === 4) {
           failed++
+          if (key.startsWith('history/')) historyFailed++
           console.log(
             `[upload] FAIL ${key} (after ${attempt} attempts): ${String(err).slice(0, 300)}`
           )
-          return
+          return false
         }
         await delay(500 * 2 ** (attempt - 1))
       }
     }
+    return false
   }
   const drain = async (paths: string[]): Promise<void> => {
     const queue = [...paths]
@@ -354,7 +361,11 @@ export async function uploadSeedRoot(
   // The ONE history manifest is MERGED with R2, never replaced by a local
   // partial: a gap repair updates only its targets, and the daily ETL only its
   // own session's symbols. A missing manifest is a safe empty merge.
-  if (manifestPath !== null) {
+  // The manifest is a CLAIM about the history objects. If any history PUT
+  // failed, publishing a newer manifest would make the next safety guard trust
+  // a date the object does not actually carry, so leave the previous index in
+  // place and let the per-object fallback detect the gap.
+  if (manifestPath !== null && historyFailed === 0) {
     let local: HistoryManifest | null = null
     try {
       local = readHistoryManifest(JSON.parse(await readFile(manifestPath, 'utf8')))
@@ -384,15 +395,29 @@ export async function uploadSeedRoot(
       }
     }
   }
+  // The snapshot names every row the histories must already carry. A failed
+  // history upload therefore WITHHOLDS the publication: a reader must never
+  // see a grid whose history objects are still a session behind. The previous
+  // snapshot stays live; the next ETL run repairs and republishes.
+  let snapshotPublished = false
   if (snapshotPath !== null) {
-    await put(snapshotPath)
-    console.log('[upload] snapshot published last')
+    if (historyFailed > 0) {
+      console.log(
+        `[upload] snapshot withheld — ${historyFailed} history object(s) failed; ` +
+          'the previous snapshot remains published'
+      )
+    } else {
+      snapshotPublished = await put(snapshotPath)
+      if (snapshotPublished) console.log('[upload] snapshot published last')
+    }
   }
-  // The publication stamp LAST: every non-history edge entry keys on it, so
-  // the new session replaces the cached grid within the Function's one-minute
-  // memo — no purge API and no client cache-buster. A failure only means the
-  // edge keeps the old grid for its own TTL, never a broken object.
-  await putVersion(client, config)
+  // The publication stamp LAST: every non-history edge entry (grid, market,
+  // holdings, dividends, benchmark) keys on it, so a new session/object replaces
+  // the cached copy within the Function's one-minute memo. A histories-only
+  // backfill deliberately skips it; a market-only repair still needs it. A
+  // failed history leaves the snapshot withheld, but a successfully uploaded
+  // independent object must still be served.
+  if (nonHistoryDone > 0) await putVersion(client, config)
   client.destroy()
   return { files: files.length, failed }
 }

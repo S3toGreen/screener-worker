@@ -30,6 +30,7 @@
  * Requires R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_ENDPOINT (or
  * CLOUDFLARE_ACCOUNT_ID), the same credentials the ETL uses.
  */
+import { appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   GetObjectCommand,
@@ -63,6 +64,23 @@ const arg = (name: string): string | undefined => {
 const repair = process.argv.includes('--repair')
 const dryRun = process.argv.includes('--dry-run')
 const months = Math.max(1, Math.min(36, Number(arg('months') ?? 36) || 36))
+
+/** Tell the workflow whether a repair was launched, so its following seed can
+ *  FORCE a snapshot rebuild. Without this, a holiday repair leaves the
+ *  snapshot's derived columns stale until the next trading session. */
+function emitRepairOutput(repaired: boolean): void {
+  const file = process.env.GITHUB_OUTPUT
+  if (!file) return
+  try {
+    appendFileSync(file, `repaired=${repaired}\n`)
+  } catch {
+    // A local/CI output failure must never change the data outcome.
+  }
+}
+/** A 61-column JSON history cannot legitimately be this small; an empty or
+ *  truncated object must be READ and repaired, never trusted through the
+ *  manifest's last-date claim. */
+const SUSPECT_HISTORY_BYTES = 128
 
 const isNoSuchKey = (err: unknown): boolean => {
   const e = err as { name?: string; Code?: string; $metadata?: { httpStatusCode?: number } }
@@ -194,6 +212,7 @@ async function readLastDates(
 const snapshot = await readSnapshot()
 if (!snapshot) {
   console.log('[safety] no snapshot in R2 — nothing to compare yet')
+  emitRepairOutput(false)
   client.destroy()
   process.exit(0)
 }
@@ -218,7 +237,11 @@ const lastDates = new Map<string, number>()
 const unknown: string[] = []
 for (const symbol of wanted) {
   const ms = manifestDates.get(symbol) ?? 0
-  if (ms > 0) lastDates.set(symbol, ms)
+  // A manifest date is only a fast path for a plausible object. A suspiciously
+  // small (or size-less) object is re-read; a corrupt/truncated file must never
+  // survive because the index says its date is current.
+  const size = histories.get(symbol) ?? 0
+  if (ms > 0 && size >= SUSPECT_HISTORY_BYTES) lastDates.set(symbol, ms)
   else unknown.push(symbol)
 }
 if (unknown.length > 0) {
@@ -238,6 +261,7 @@ console.log(
     `${snapshot.rows.length} symbols · ${histories.size} histories · ${missing.length} to repair`
 )
 if (missing.length === 0) {
+  emitRepairOutput(false)
   client.destroy()
   process.exit(0)
 }
@@ -249,11 +273,13 @@ console.log(
 )
 if (!repair) {
   console.log('[safety] detection only — rerun with --repair to rebuild these histories')
+  emitRepairOutput(false)
   client.destroy()
   process.exit(0)
 }
 if (dryRun) {
   console.log('[safety] dry run — no backfill launched')
+  emitRepairOutput(false)
   client.destroy()
   process.exit(0)
 }
@@ -280,6 +306,9 @@ if (code !== 0) {
   console.error(`[safety] backfill exited ${code} — the missing histories were NOT repaired`)
   process.exit(code || 1)
 }
+// A repair was attempted and uploaded (histories-only). The workflow's seed
+// must force its snapshot rebuild even on a day with no new session.
+emitRepairOutput(true)
 // Re-list with a fresh client: a repair that still cannot produce rows (a
 // suspended/new instrument) is surfaced, never treated as success.
 const afterClient = new S3Client({

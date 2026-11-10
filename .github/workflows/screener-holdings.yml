@@ -18,7 +18,8 @@ on:
     # daily ETL's crons proved that key is not applied to the registered
     # schedule (the 2026-11-03 runs landed on the UTC walls), and a collector
     # that silently fires eight hours early must never ship again.
-    - cron: '0 13 * * 5'
+    - cron: '45 21 * * 5'
+      timezone: "Asia/Taipei"
   workflow_dispatch:
     inputs:
       symbols:

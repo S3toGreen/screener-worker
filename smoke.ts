@@ -37,6 +37,7 @@ import {
 } from '@odf/screener-worker/services/screenerService'
 import type { StorageAdapter } from '@odf/screener-worker/services/storage'
 import { serveApi } from './src/serve'
+import { readHistoryManifest } from './src/manifest'
 import { DATA_CACHE_CONTROL } from './src/keys'
 import type { ScreenerEnv } from './src/env'
 
@@ -207,8 +208,34 @@ check(snapBody === snapshotText, '/api/snapshot serves the object byte-for-byte'
 check(snapRes.headers.get('x-edge-cache') === 'miss', 'first read is an edge miss')
 const hit = await get('/api/snapshot')
 check(hit.headers.get('x-edge-cache') === 'hit', 'second read is an edge hit')
+// The client's `?t=` is a BROWSER cache-buster; the edge key deliberately
+// ignores client query strings and follows the published version stamp. A
+// forced client pull must not evict or bypass the edge entry.
 const forced = await get(`/api/snapshot?t=${Date.now()}`)
-check(forced.headers.get('x-edge-cache') === 'miss', '?t= bypasses the edge cache')
+check(forced.headers.get('x-edge-cache') === 'hit', 'client ?t= keeps the edge entry')
+
+// The derived-history index is part of the published contract (the safety
+// guard reads it instead of thousands of objects). It must exist and validate.
+const manifestPath = join(root, 'history-manifest.json')
+const manifestText = existsSync(manifestPath) ? await readFile(manifestPath, 'utf8') : null
+check(manifestText !== null, 'history manifest written')
+if (manifestText !== null) {
+  let parsed: unknown = null
+  try {
+    parsed = JSON.parse(manifestText)
+  } catch {
+    check(false, 'history manifest parses')
+  }
+  if (parsed !== null) {
+    const manifest = readHistoryManifest(parsed)
+    check(manifest !== null, 'history manifest shape')
+    check(
+      manifest !== null && Object.keys(manifest.symbols).length > 500,
+      'history manifest coverage',
+      manifest ? `${Object.keys(manifest.symbols).length} symbols` : ''
+    )
+  }
+}
 
 const marketRes = await get('/api/market')
 check(marketRes.status === 200, '/api/market status', `${marketRes.status}`)

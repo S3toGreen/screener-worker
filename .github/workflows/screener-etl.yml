@@ -28,16 +28,19 @@ on:
     # (measured: absent at 21:20 Taipei, present by the next morning), so this
     # run is EXPECTED to be partial on those three. `seed.ts` defers them to
     # the guard instead of burning a retry (KNOWN_LATE_SOURCES).
-    - cron: '15 10 * * 1-5'
+    - cron: '15 18 * * 1-5'
+      timezone: 'Asia/Taipei'
     # 21:15 Taipei — the second attempt (a failed/missed first run stores the
     # session here). On a healthy evening the freshness gate skips it.
-    - cron: '15 13 * * 1-5'
+    - cron: '15 21 * * 1-5'
+      timezone: 'Asia/Taipei'
     # 03:45 Taipei, Tue–Sat — the GUARD. It runs FORCED: a late-published
     # file must overwrite the session the evening stored (null never
     # overwrites, so it only fills/corrects), and a session the evening never
     # published still lands. On a complete evening it is a ZERO-WRITE no-op
     # (byte-identical histories and grid are not rewritten).
-    - cron: '45 19 * * 1-5'
+    - cron: '45 3 * * 2-6'
+      timezone: 'Asia/Taipei'
   workflow_dispatch:
     inputs:
       force:
@@ -125,6 +128,7 @@ jobs:
       # daily seed rebuilds the snapshot from them. Holidays/typhoons answer a
       # valid empty table and are skipped by the backfill, never zero sessions.
       - name: Fill missing histories (safety guard)
+        id: safety
         timeout-minutes: 35
         run: bun safety.ts --repair
 
@@ -143,10 +147,29 @@ jobs:
           if [ "${{ inputs.force }}" = 'true' ] || [ "${{ github.event.schedule }}" = '45 19 * * 1-5' ]; then
             force='--force'
           fi
+          # A safety repair changed a history. Rebuild the snapshot's derived
+          # columns from the repaired histories even if this is a holiday and
+          # no new session was published.
+          if [ "${{ steps.safety.outputs.repaired }}" = 'true' ]; then
+            force='--force'
+          fi
           echo "seed $force"
           bun seed.ts $force
           echo "code=$?" >> "$GITHUB_OUTPUT"
           exit 0
+
+      # Credential-free local smoke over the exact objects the seed just
+      # produced: shapes, history manifest, the Pages function's edge keys and
+      # cache-buster behavior. It needs only `.seed-out/`, never R2.
+      - name: Smoke the local publish
+        if: steps.seed.outputs.code == '0' || steps.seed.outputs.code == '3'
+        run: |
+          # A holiday/freshness skip exits 0 without publishing .seed-out.
+          if [ -f .seed-out/screener-latest.json ]; then
+            bun run smoke
+          else
+            echo 'no local snapshot — no publication to smoke'
+          fi
 
       # The public API is the deployment: a stale Pages function (it once
       # predated the fund universe and 404'd every ETF history) or a missed
