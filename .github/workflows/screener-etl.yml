@@ -23,15 +23,13 @@ name: Screener ETL
 
 on:
   schedule:
-    # 18:15 Taipei — the first publish. Most sources are out; margin tables are late.
-    - cron: '15 18 * * 1-5'
-      timezone: 'Asia/Taipei'
-    # 21:15 Taipei — the second attempt (catch-up for evening tables).
-    - cron: '15 21 * * 1-5'
-      timezone: 'Asia/Taipei'
-    # 03:45 Taipei, Tue–Sat — the GUARD. It runs FORCED.
-    - cron: '45 3 * * 2-6'
-      timezone: 'Asia/Taipei'
+    # GitHub Actions runs cron in UTC; `timezone:` is NOT applied.
+    # 18:15 Taipei = 10:15 UTC, Mon–Fri.
+    - cron: '15 10 * * 1-5'
+    # 21:15 Taipei = 13:15 UTC, Mon–Fri (the evening repair pass).
+    - cron: '15 13 * * 1-5'
+    # 03:45 Taipei, Tue–Sat = 19:45 UTC, Mon–Fri. The GUARD runs FORCED.
+    - cron: '45 19 * * 1-5'
   workflow_dispatch:
     inputs:
       force:
@@ -103,9 +101,9 @@ jobs:
         run: |
           set +e
           force=''
-          # The 03:45 guard is ALWAYS a forced same-session rewrite.
-          # MATCHED TO TAIPEI TIME CRON: '45 3 * * 2-6'
-          if [ "${{ inputs.force }}" = 'true' ] || [ "${{ github.event.schedule }}" = '45 3 * * 2-6' ]; then
+          # The 03:45 Taipei guard is ALWAYS a forced same-session rewrite.
+          # GitHub emits the UTC cron: 19:45 UTC, Mon–Fri.
+          if [ "${{ inputs.force }}" = 'true' ] || [ "${{ github.event.schedule }}" = '45 19 * * 1-5' ]; then
             force='--force'
           fi
           # A safety repair changed a history. Rebuild the snapshot even on holidays.
@@ -143,10 +141,10 @@ jobs:
             exit 0
           fi
 
-          # MATCHED TO TAIPEI TIME CRONS: 18:15 and 21:15
+          # GitHub emits the UTC crons for 18:15/21:15 Taipei.
           early_schedule=''
           case "$sched" in
-            '15 18 * * 1-5' | '15 21 * * 1-5') early_schedule=1 ;;
+            '15 10 * * 1-5' | '15 13 * * 1-5') early_schedule=1 ;;
           esac
 
           # A PARTIAL run (seed=3) is a warning ONLY where a later repair is

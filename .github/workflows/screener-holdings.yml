@@ -1,31 +1,28 @@
-# The weekly TDCC 集保戶股權分散 collector (千張大戶 share).
+# Weekly TDCC (集保結算所) equity distribution refresh.
+# TDCC publishes the weekly shareholder distribution (1-999 shares up to >1000張大戶)
+# every Friday evening (usually between 19:30 and 21:30 Taipei time).
 #
-# TDCC publishes ONE stock per POST behind a one-time form token, so the whole
-# market costs ~2 requests per symbol — ~30 minutes once a week, which is why
-# this is a separate job: the daily ETL joins the stored object and never
-# scrapes the portal itself. A run under 50 % coverage keeps the previous
-# object (a throttled scrape must not erase a complete one).
-#
-# Required repository secrets: R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY /
-# R2_ENDPOINT (the same three the daily ETL uses).
+# This standalone workflow ingests the newest Friday report, updates the rolling
+# 3-year holdings history in R2, and leaves the daily ETL to join `retailPct`
+# and `bigHolderPct` directly from R2.
 
-name: Screener holdings (weekly)
+name: Screener Holdings (Weekly TDCC)
 
 on:
   schedule:
-    # Friday 13:00Z = 21:00 Taipei (UTC+8, no DST) — TDCC publishes the week's
-    # table on Friday evening. Explicit UTC, never a `timezone:` key: the
-    # daily ETL's crons proved that key is not applied to the registered
-    # schedule (the 2026-11-03 runs landed on the UTC walls), and a collector
-    # that silently fires eight hours early must never ship again.
+    # Friday 21:45 Taipei — primary weekly run (published by 21:30 on normal weeks).
     - cron: '45 21 * * 5'
-      timezone: "Asia/Taipei"
+      timezone: 'Asia/Taipei'
+    # Saturday 09:15 Taipei — catch-up guard (in case TDCC delayed publication on Friday).
+    # If Friday already succeeded, the internal freshness gate skips rewriting.
+    - cron: '15 9 * * 6'
+      timezone: 'Asia/Taipei'
   workflow_dispatch:
     inputs:
-      symbols:
-        description: Comma-separated smoke list (empty = the whole universe)
-        type: string
-        default: ""
+      force:
+        description: Force rewrite the holdings dataset even if already current
+        type: boolean
+        default: false
 
 concurrency:
   group: screener-holdings
@@ -36,7 +33,7 @@ permissions:
 
 jobs:
   holdings:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -52,11 +49,11 @@ jobs:
           date -u '+started %Y-%m-%dT%H:%M:%SZ (UTC)'
           TZ=Asia/Taipei date '+started %Y-%m-%d %H:%M:%S (Taipei)'
 
-      - name: Check the R2 secrets
+      - name: Check R2 secrets
         run: |
           for k in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT; do
             if [ -z "${!k}" ]; then
-              echo "::error::repository secret $k is missing — the collector cannot read or upload R2"
+              echo "::error::repository secret $k is missing"
               exit 1
             fi
           done
@@ -71,11 +68,15 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Collect TDCC holdings
-        timeout-minutes: 50
+      - name: Fetch and upload TDCC Holdings
         run: |
-          if [ -n "${{ inputs.symbols }}" ]; then
-            bun holdings.ts --symbols "${{ inputs.symbols }}" --dry-run
-          else
-            bun holdings.ts
+          force=''
+          if [ "${{ inputs.force }}" = 'true' ]; then
+            force='--force'
           fi
+          echo "Running holdings ETL $force..."
+          bun holdings.ts $force
+
+      - name: Verify holdings in R2
+        timeout-minutes: 5
+        run: bun verify.ts
