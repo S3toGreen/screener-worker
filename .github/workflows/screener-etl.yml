@@ -40,10 +40,10 @@ on:
         default: false
       phase:
         description: >-
-          strict = fail if any table is missing.
-          Leave empty or 'early' to allow partials (code 3) as warnings.
+          early = a partial is only a warning (a later run repairs it).
+          Leave empty for a strict run (the default).
         type: string
-        default: 'early'
+        default: ''
 
 concurrency:
   group: screener-etl
@@ -137,7 +137,6 @@ jobs:
           seed='${{ steps.seed.outputs.code }}'
           sched='${{ github.event.schedule }}'
           phase='${{ inputs.phase }}'
-          event='${{ github.event_name }}'
 
           if [ "$seed" = '0' ]; then
             echo 'ETL complete (all tables published).'
@@ -150,14 +149,13 @@ jobs:
             '15 18 * * 1-5' | '15 21 * * 1-5') early_schedule=1 ;;
           esac
 
-          # A PARTIAL run (seed=3) is allowed as a warning:
-          # 1. During early/evening scheduled slots (18:15, 21:15).
-          # 2. Or when triggered manually and phase is NOT explicitly set to 'strict'.
-          if [ "$seed" = '3' ]; then
-            if [ "$early_schedule" = '1' ] || [ "$phase" = 'early' ] || { [ "$event" = 'workflow_dispatch' ] && [ "$phase" != 'strict' ]; }; then
-              echo "::warning::ETL partial (seed=3) — late tables (margin/SBL) pending. The later slot/guard will repair them."
-              exit 0
-            fi
+          # A PARTIAL run (seed=3) is a warning ONLY where a later repair is
+          # guaranteed: the 18:15/21:15 schedule slots, or an explicit
+          # `phase: early` dispatch. A plain manual dispatch is STRICT — a
+          # partial market object must never be laundered green.
+          if [ "$seed" = '3' ] && { [ "$early_schedule" = '1' ] || [ "$phase" = 'early' ]; }; then
+            echo "::warning::ETL partial (seed=3) — late tables (margin/SBL) pending. The later slot/guard will repair them."
+            exit 0
           fi
 
           echo "ETL FAILED: seed=${seed:-not-run} schedule=${sched:-none}" >&2
