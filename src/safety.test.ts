@@ -5,10 +5,11 @@ import { classifyBarDay, findMissingHistories } from './safety'
 
 const session = stampToMs('20261104')
 
-function row(symbol: string, listed: string | null): ScreenerRow {
+function row(symbol: string, listed: string | null, volume = 1000): ScreenerRow {
   const out: ScreenerRow = SCREENER_FIELDS.map(() => null)
   out[SC.symbol] = symbol
   out[SC.listedDate] = listed
+  out[SC.volume] = volume
   return out
 }
 
@@ -37,6 +38,17 @@ describe('findMissingHistories', () => {
     const last = new Map([['2330', stampToMs('20261103')]])
     expect(findMissingHistories([row('2330', '19940905')], last, session)).toEqual([
       { symbol: '2330', reason: 'stale 20261103' }
+    ])
+  })
+
+  test('a no-trade stale history is NOT chased: there is no session to append', () => {
+    const last = new Map([['020001', stampToMs('20261103')]])
+    expect(findMissingHistories([row('020001', '20040609', 0)], last, session)).toEqual([])
+  })
+
+  test('a no-trade row with an ABSENT history is still a real loss', () => {
+    expect(findMissingHistories([row('020001', '20040609', 0)], new Map(), session)).toEqual([
+      { symbol: '020001', reason: 'absent' }
     ])
   })
 

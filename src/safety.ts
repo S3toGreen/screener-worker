@@ -8,6 +8,12 @@
  * its first existing date anyway).
  *
  * A NEW listing with no history is exempt: the daily ETL starts it.
+ *
+ * A STALE history is only a repair candidate when the snapshot row actually
+ * TRADED that session (`volume > 0`). Suspended / delisted / no-trade rows
+ * legitimately have no row for the session; requiring one made the guard
+ * repair the same eight symbols on every run forever. An ABSENT history is
+ * still repaired regardless of volume: a missing object is a real loss.
  */
 import { DAY_MS, dayStampOf, stampToMs } from '@odf/screener-worker/session'
 import { SC, type ScreenerRow } from '@odf/screener-worker/screener'
@@ -55,7 +61,10 @@ export function findMissingHistories(
     }
     // Contiguous history: once the latest completed session is present there
     // is nothing behind it to repair (a short but current series is valid).
-    if (last < sessionDate) out.push({ symbol, reason: `stale ${dayStampOf(last)}` })
+    // A no-trade row cannot have a session in its history — do not chase it.
+    const volume = row[SC.volume]
+    const traded = typeof volume === 'number' && volume > 0
+    if (traded && last < sessionDate) out.push({ symbol, reason: `stale ${dayStampOf(last)}` })
   }
   return out
 }
