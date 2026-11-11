@@ -337,9 +337,10 @@ export interface ScreenerBenchmark {
  *  the markets both halves actually covered (a missing TPEx summary falls back
  *  to the TWSE-only estimate rather than inflating the ratio).
  *
- *  `officialMaintenanceRatio` is TWSE's OWN published 全市場擔保維持率
- *  (`BFIJ3U_TREND` keepRate) — the exchange's figure, TWSE-only, carried only
- *  when it is the session's. */
+ *  `officialMaintenanceRatio` is the exchange's published 全市場擔保維持率
+ *  (`BFIJ3U` / `BFIJ3U_TREND` keepRate) — carried only when it is the
+ *  session's. The TPEx dashboard `keepRate` is a convenience duplicate and is
+ *  not the official source. */
 export interface MarketCredit {
   scope: 'TWSE+TPEX' | 'TWSE'
   sessionDate: number
@@ -379,18 +380,36 @@ export interface MarketCredit {
   tpexShortBalanceLots: number | null
   tpexShortPrevLots: number | null
   tpexShortChangeLots: number | null
-  /** The OTC dashboard's money summary (億元 ×1e8). */
-  tpexMarginBalanceNtd: number | null
+  /** The OTC dashboard's credit amount (億元 ×1e8); null before the dashboard
+   *  series starts (2026-09-10) or when the dashboard has no session. */
   tpexCreditAmountNtd: number | null
+  /** TPEx whole-market cap from `afterTrading/highlight` (NT$). */
   tpexMarketCapNtd: number | null
+  /** TPEx `margin/balance` summary money row (`融資金(仟元)` ×1000); historical. */
+  tpexMarginBalanceNtd: number | null
+  tpexMarginBuyNtd?: number | null
+  tpexMarginSellNtd?: number | null
+  tpexMarginCashRepayNtd?: number | null
+  tpexMarginPrevNtd?: number | null
+  /** Symmetric whole-market market/flow values. TotalAmount is WITH TDR/ETF
+   *  (TWSE MI_INDEX 1,2,4,6,14,15; TPEx marketStats 1,2,3,5,6); the Stock*
+   *  variant excludes TDR/ETF (TWSE 1,6,14,15; TPEx 1,2,3). */
+  twseMarketCapNtd?: number | null
+  twseTotalAmountNtd?: number | null
+  twseStockTotalAmountNtd?: number | null
+  twseCreditAmountNtd?: number | null
+  tpexTotalAmountNtd?: number | null
+  tpexStockTotalAmountNtd?: number | null
+  totalAmountNtd?: number | null
+  stockTotalAmountNtd?: number | null
+  creditAmountNtd?: number | null
   /** Σ margin balance lots × price over the markets in `scope` (NT$). */
   financedValueNtd: number | null
   /** The announced loan balance: TWSE 融資金額 (+ TPEx 融資餘額), NT$. */
   loanBalanceNtd: number | null
-  /** Σ the SNAPSHOT ROWS' market caps over the markets in `scope`. Listed funds
-   *  without a share count are excluded from BOTH halves; the OTC dashboard's
-   *  whole-market cap is carried separately (`tpexMarketCapNtd`) and is never
-   *  mixed into this denominator. */
+  /** Whole-market cap: TWSE MI_QFIIS issued shares × MI_INDEX closes (stocks
+   *  only) plus the TPEx highlight cap when BOTH aggregate halves exist; a
+   *  missing half falls back to the row-derived cap over `scope`. */
   marketCapNtd: number | null
   /** loanBalanceNtd ÷ marketCapNtd × 100. */
   marginToMarketCap: number | null
@@ -399,7 +418,8 @@ export interface MarketCredit {
   maintenanceRatioKind: 'estimate'
   /** Provenance line the panel prints under the value. */
   maintenanceRatioNote: string
-  /** TWSE's own 整戶擔保維持率 (`BFIJ3U_TREND` keepRate), same session only. */
+  /** The exchange's published 全市場擔保維持率 (`BFIJ3U`/`BFIJ3U_TREND`
+   *  keepRate), same session only. */
   officialMaintenanceRatio: number | null
 }
 
@@ -888,6 +908,19 @@ export function readMarketContext(raw: unknown): MarketContext | null {
       tpexMarginBalanceNtd: marketNum(credit.tpexMarginBalanceNtd),
       tpexCreditAmountNtd: marketNum(credit.tpexCreditAmountNtd),
       tpexMarketCapNtd: marketNum(credit.tpexMarketCapNtd),
+      twseMarketCapNtd: marketNum(credit.twseMarketCapNtd),
+      twseTotalAmountNtd: marketNum(credit.twseTotalAmountNtd),
+      twseStockTotalAmountNtd: marketNum(credit.twseStockTotalAmountNtd),
+      twseCreditAmountNtd: marketNum(credit.twseCreditAmountNtd),
+      tpexTotalAmountNtd: marketNum(credit.tpexTotalAmountNtd),
+      tpexStockTotalAmountNtd: marketNum(credit.tpexStockTotalAmountNtd),
+      tpexMarginBuyNtd: marketNum(credit.tpexMarginBuyNtd),
+      tpexMarginSellNtd: marketNum(credit.tpexMarginSellNtd),
+      tpexMarginCashRepayNtd: marketNum(credit.tpexMarginCashRepayNtd),
+      tpexMarginPrevNtd: marketNum(credit.tpexMarginPrevNtd),
+      totalAmountNtd: marketNum(credit.totalAmountNtd),
+      stockTotalAmountNtd: marketNum(credit.stockTotalAmountNtd),
+      creditAmountNtd: marketNum(credit.creditAmountNtd),
       financedValueNtd: marketNum(credit.financedValueNtd),
       loanBalanceNtd: marketNum(credit.loanBalanceNtd),
       marketCapNtd: marketNum(credit.marketCapNtd),

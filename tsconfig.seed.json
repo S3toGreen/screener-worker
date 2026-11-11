@@ -29,6 +29,7 @@
     "src/credit.test.ts",
     "src/etl.test.ts",
     "src/history.test.ts",
+    "src/marketHistory.test.ts",
     "src/historyMerge.test.ts",
     "src/manifest.test.ts",
     "src/safety.test.ts",

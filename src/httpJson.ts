@@ -33,6 +33,12 @@ export type FetchLike = (url: string, init?: FetchInit) => Promise<HttpResult>
 const defaultFetch = (url: string, init?: FetchInit): Promise<HttpResult> =>
   (globalThis as unknown as { fetch: FetchLike }).fetch(url, init)
 
+/** TWSE's RWD host answers HTTP 428 to Bun's default `Bun/…` User-Agent for
+ *  historical `MI_MARGN`/`MI_INDEX` pages (verified 2026-11-11). A browser UA
+ *  is the accepted request shape and is harmless for the other public hosts. */
+const BROWSER_UA =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+
 /** `AbortSignal.timeout` where the runtime has it (every target does today). */
 const timeoutSignal = (ms: number): unknown =>
   (
@@ -68,7 +74,10 @@ function polite(): Promise<void> {
  *  decides whether that is fatal — the ETL degrades per source). */
 async function request(url: string, fetchImpl: FetchLike, timeoutMs: number): Promise<HttpResult> {
   await polite()
-  const res = await fetchImpl(url, { signal: timeoutSignal(timeoutMs) })
+  const res = await fetchImpl(url, {
+    headers: { 'user-agent': BROWSER_UA },
+    signal: timeoutSignal(timeoutMs)
+  })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
   return res
 }
@@ -122,7 +131,10 @@ export async function postText(
   await polite()
   const res = await fetchImpl(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      'user-agent': BROWSER_UA
+    },
     body,
     signal: timeoutSignal(timeoutMs)
   })

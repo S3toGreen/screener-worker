@@ -60,8 +60,10 @@ export interface Background {
  *  snapshot; v8 = 72 columns + the `market` block inside the snapshot;
  *  v9 = the market context split into its own `/api/market`; v10 = the
  *  official maintenance ratio (BFIJ3U) and no 融資金額 family; v11 = the
- *  73-column credit-trading extension; v12 = the rolling market history. */
-const CACHE_VERSION = '12'
+ *  73-column credit-trading extension; v12 = the rolling market history;
+ *  v13 = the symmetric whole-market market/turnover/credit fields and TPEx
+ *  margin money. */
+const CACHE_VERSION = '13'
 
 /** One R2 read per minute per isolate — the stamp only moves once a session. */
 const VERSION_TTL_MS = 60_000

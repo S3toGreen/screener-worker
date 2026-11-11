@@ -18,7 +18,7 @@ import {
   RISK_STOP_FUNDS,
   RISK_STOP_TRADING
 } from '@odf/screener-worker/screener'
-import { dayStampOf } from '@odf/screener-worker/session'
+import { dayStampOf, stampToMs } from '@odf/screener-worker/session'
 import {
   changePctOf,
   dateToMs,
@@ -184,11 +184,49 @@ export function maintenanceRowOf(raw: unknown, dateMs: number): MaintenancePoint
     if (!row || typeof row !== 'object') continue
     const r = row as Record<string, unknown>
     if (typeof r.date !== 'string' || r.date.trim() !== stamp) continue
-    const keepRate = typeof r.keepRate === 'number' ? r.keepRate : Number(r.keepRate)
+    const keepRate = num(r.keepRate as string | number | undefined | null)
     if (!Number.isFinite(keepRate) || keepRate <= 0) return null
-    return { dateMs, keepRate }
+    const crdAmt = num(r.crdAmt as string | number | undefined | null)
+    return {
+      dateMs,
+      keepRate,
+      creditAmountNtd: Number.isFinite(crdAmt) ? crdAmt : null
+    }
   }
   return null
+}
+
+/** The n-session official series; ONE request for the whole backfill window.
+ *  The `BFIJ3U_TREND` rows are the official 全市場 keepRate plus `crdAmt`. */
+export async function twseOfficialTrend(
+  days: number,
+  dateMs: number,
+  fetchImpl?: FetchLike
+): Promise<Map<number, MaintenancePoint>> {
+  const stamp = dayStampOf(dateMs)
+  const payload = (await getJson(
+    `${RWD}/marginTrading/BFIJ3U_TREND?response=json&days=${Math.max(1, days)}&date=${stamp}`,
+    fetchImpl,
+    45_000
+  )) as { stat?: string; data?: Array<Record<string, unknown>> } | null
+  const out = new Map<number, MaintenancePoint>()
+  if (payload?.stat !== 'OK' || !Array.isArray(payload.data)) return out
+  for (const row of payload.data) {
+    if (!row || typeof row !== 'object') continue
+    const date = typeof row.date === 'string' ? row.date.trim() : ''
+    if (!/^\d{8}$/.test(date)) continue
+    const at = stampToMs(date)
+    if (!at) continue
+    const keepRate = num(row.keepRate as string | number | undefined | null)
+    if (!Number.isFinite(keepRate) || keepRate <= 0) continue
+    const crdAmt = num(row.crdAmt as string | number | undefined | null)
+    out.set(at, {
+      dateMs: at,
+      keepRate,
+      creditAmountNtd: Number.isFinite(crdAmt) ? crdAmt : null
+    })
+  }
+  return out
 }
 
 /** The risk / method-change lists, OR-ed into one bitmask per symbol.
@@ -273,11 +311,14 @@ export async function twseUpcomingDividends(fetchImpl?: FetchLike): Promise<Divi
 }
 
 /**
- * 當沖 (day-trade) volume per stock — TWSE `exchangeReport/TWTB4U`, one payload
- * per session: `tables[0]` is the market aggregate, `tables[1]` the per-stock
- * rows. The payload's own `date` gates the answer (the endpoint, like every
- * other TWSE one, serves the LATEST session rather than nothing on a closed
- * day — a stale answer must read as absent, never as today's).
+ * 當沖 (day-trade) volume per stock — TWSE RWD
+ * `/rwd/zh/dayTrading/TWTB4U`, one payload per session: `tables[0]` is the
+ * market aggregate, `tables[1]` the per-stock rows. The payload's own `date`
+ * gates the answer (the endpoint, like every other TWSE one, serves the LATEST
+ * session rather than nothing on a closed day — a stale answer must read as
+ * absent, never as today's). On the current session the RWD endpoint can answer
+ * a STUB (only the code/name columns, no 當沖 columns) before the report is
+ * published; the missing-column guard below makes that a clean null.
  */
 export async function twseDayTrade(
   dateMs: number,
@@ -285,9 +326,7 @@ export async function twseDayTrade(
 ): Promise<Map<string, number> | null> {
   const day = dayStampOf(dateMs)
   if (!day) return null
-  // The legacy `exchangeReport` host — the rwd twin (`/rwd/zh/afterTrading/
-  // TWTB4U`) answers 404, and the OpenAPI host does not carry this dataset.
-  const url = `https://www.twse.com.tw/exchangeReport/TWTB4U?response=json&date=${day}&selectType=All`
+  const url = `https://wwwc.twse.com.tw/rwd/zh/dayTrading/TWTB4U?date=${day}&selectType=All&response=json`
   const payload = (await getJson(url, fetchImpl, TABLE_TIMEOUT_MS)) as {
     stat?: string
     date?: string
@@ -297,6 +336,9 @@ export async function twseDayTrade(
   const table = payload.tables?.[1]
   if (!table?.fields || !table.data || table.data.length === 0) return null
   const at = indexer(table.fields.map((f) => f.trim()))
+  // A not-yet-published session answers a stub with only code/name columns.
+  // Never let a missing column turn into a fabricated zero map.
+  if (!table.fields.some((f) => f.trim() === '當日沖銷交易成交股數')) return null
   const out = new Map<string, number>()
   let sum = 0
   for (const row of table.data) {

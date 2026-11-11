@@ -70,11 +70,16 @@ import {
   tpexDayQuotes,
   tpexDaySblBal,
   tpexDayValuation,
+  tpexDayMarketStats,
+  tpexDayHighlight,
+  tpexDayMarginFull,
   twseDayForeign,
   twseDayQuotes,
   twseDayValuation,
+  twseDayMarket,
   twseMarginDay,
-  twseDaySblBal
+  twseDaySblBal,
+  twseStockMarketCap
 } from './history'
 import { isScreenerSymbol } from './universe'
 import { exDivInDays, mergeDividends, readDividends } from './dividends'
@@ -138,8 +143,8 @@ const ROLL_TOD_MS = 15 * 3_600_000
 /** A market-wide daily table must hold at least this many stock rows — a
  *  truncated payload (~430 rows once) is a broken table, not a quiet day: the
  *  market falls back to the carried rows exactly like a stale session. */
-const TWSE_DAILY_MIN_ROWS = 900
-const TPEX_DAILY_MIN_ROWS = 700
+export const TWSE_DAILY_MIN_ROWS = 900
+export const TPEX_DAILY_MIN_ROWS = 700
 /** A listing universe below these row counts is a truncated payload, not a
  *  quiet market. Keep the daily rows (their own identity/name) instead of
  *  rejecting every symbol the truncated universe omits. The counts sit below
@@ -370,11 +375,10 @@ export async function runEtl(
     readSafe('twse.foreign', degraded, late, () => twseDayForeign(sessionDate)),
     readSafe('tpex.foreign', degraded, late, () => tpexDayForeign(sessionDate)),
     // 當沖: each exchange's own per-session report (TWSE `TWTB4U` /
-    // TPEx `intraday/stat`, both per-stock).
-    // A null day-trade answer is retried once: both exchanges' archives are
-    // complete per session, so an empty payload is an edge miss, not a gap.
-    readSafe('twse.dayTrade', degraded, late, () => dayTradeRetry(() => twseDayTrade(sessionDate))),
-    readSafe('tpex.dayTrade', degraded, late, () => dayTradeRetry(() => tpexDayTrade(sessionDate)))
+    // TPEx `intraday/stat`, both per-stock). A null answer means the report is
+    // not published yet (or a holiday); it is `late`, never retried here.
+    readSafe('twse.dayTrade', degraded, late, () => twseDayTrade(sessionDate)),
+    readSafe('tpex.dayTrade', degraded, late, () => tpexDayTrade(sessionDate))
   ])
 
   // Market-wide context is AUXILIARY: one retry, then a log — a failed read
@@ -443,9 +447,46 @@ export async function runEtl(
       perDateFirst('twse.sbl', null, sessionDate, twseDaySblBal, degraded, late)
     ])
 
+  // Whole-market aggregates are AUXILIARY: the equity grid must publish even
+  // when these reads are unavailable. TWSE MI_INDEX/MI_QFIIS and TPEx
+  // marketStats/highlight are primitives; the dashboard supplies only the
+  // TPEx creditAmount (before 09/10 it is absent by definition).
+  const [twseMarketNow, tpexMarketStatsNow, tpexHighlightNow, tpexMarginFullNow] =
+    await Promise.all([
+      auxiliary('TWSE market stats', () => twseDayMarket(sessionDate)),
+      auxiliary('TPEx market stats', () => tpexDayMarketStats(sessionDate)),
+      auxiliary('TPEx highlight', () => tpexDayHighlight(sessionDate)),
+      auxiliary('TPEx margin summary', () => tpexDayMarginFull(sessionDate))
+    ])
+
   // The 上市 summary and the per-stock margin columns come from ONE response.
   const creditSummary = twseMarginNow?.summary ?? null
   const tpexTotals = tpexMarNow ? marginTotalsOf(tpexMarNow.data) : null
+  const twseCap = twseStockMarketCap(twseForeign ?? null, twseMarketNow?.bars ?? null, 0.8)
+  const tpexSummaryNow: TpexCreditSummary = {
+    dateMs: sessionDate,
+    marginBalanceNtd:
+      tpexMarginFullNow?.summary?.marginBalanceNtd ?? tpexSummary?.marginBalanceNtd ?? null,
+    shortBalanceLots:
+      tpexMarginFullNow?.summary?.shortBalanceLots ?? tpexSummary?.shortBalanceLots ?? null,
+    creditAmountNtd: tpexSummary?.creditAmountNtd ?? null,
+    marketCapNtd: tpexHighlightNow?.marketCapNtd ?? tpexSummary?.marketCapNtd ?? null,
+    marginPrevNtd: tpexMarginFullNow?.summary?.marginPrevNtd ?? null,
+    marginBuyNtd: tpexMarginFullNow?.summary?.marginBuyNtd ?? null,
+    marginSellNtd: tpexMarginFullNow?.summary?.marginSellNtd ?? null,
+    marginCashRepayNtd: tpexMarginFullNow?.summary?.marginCashRepayNtd ?? null,
+    totalAmountNtd: tpexMarketStatsNow?.totalAmountNtd ?? null
+  }
+  const marketAggregates: MarketAggregates = {
+    twseMarketCapNtd: twseCap,
+    twseTotalAmountNtd: twseMarketNow?.totalAmountNtd ?? null,
+    twseStockTotalAmountNtd: twseMarketNow?.stockTotalAmountNtd ?? null,
+    twseCreditAmountNtd: maintenance?.creditAmountNtd ?? null,
+    tpexMarketCapNtd: tpexHighlightNow?.marketCapNtd ?? null,
+    tpexTotalAmountNtd: tpexMarketStatsNow?.totalAmountNtd ?? null,
+    tpexStockTotalAmountNtd: tpexMarketStatsNow?.stockTotalAmountNtd ?? null,
+    tpexCreditAmountNtd: tpexSummary?.creditAmountNtd ?? null
+  }
 
   const sources: Record<Market, MarketSources> = {
     TWSE: {
@@ -831,13 +872,14 @@ export async function runEtl(
   // session, same-session re-runs merge without erasing a published cell.
   const market = buildMarketContext(
     creditSummary,
-    tpexSummary,
+    tpexSummaryNow,
     maintenance,
     derivatives,
     rows,
     sessionDate,
     tpexTotals,
-    stale
+    stale,
+    marketAggregates
   )
   if (market) {
     let priorText: string | null = null
@@ -1090,6 +1132,7 @@ interface MarketSums {
   hasFinanced: boolean
   hasMargin: boolean
   hasShort: boolean
+  hasMarketCap: boolean
 }
 
 const emptySums = (): MarketSums => ({
@@ -1099,7 +1142,8 @@ const emptySums = (): MarketSums => ({
   shortLots: 0,
   hasFinanced: false,
   hasMargin: false,
-  hasShort: false
+  hasShort: false,
+  hasMarketCap: false
 })
 
 /** Σ a market's rows: financed value (lots × 1000 shares × NT$/share; the
@@ -1109,7 +1153,10 @@ function sumRows(rows: ScreenerRow[], market: 'TWSE' | 'TPEX'): MarketSums {
   for (const row of rows) {
     if (row[SC.market] !== market) continue
     const cap = screenNum(row, 'marketCap')
-    if (cap !== null) out.marketCapNtd += cap
+    if (cap !== null) {
+      out.marketCapNtd += cap
+      out.hasMarketCap = true
+    }
     const bal = screenNum(row, 'marginBal')
     if (bal !== null) {
       out.marginLots += bal
@@ -1137,7 +1184,7 @@ function summaryNum(v: number): number | null {
 /** The whole-market 融資融券 totals of a per-stock margin table. EVERY row is
  *  summed (ETFs included): a stock-universe sum silently undercounts the
  *  market the exchange publishes. */
-interface MarginTotals {
+export interface MarginTotals {
   marginBal: number
   marginPrev: number
   marginBuy: number
@@ -1163,7 +1210,7 @@ const MARGIN_TOTAL_KEYS: ReadonlyArray<keyof MarginTotals> = [
   'shortCashRepay'
 ]
 
-function marginTotalsOf(data: Map<string, MarginSrc>): MarginTotals | null {
+export function marginTotalsOf(data: Map<string, MarginSrc>): MarginTotals | null {
   if (data.size === 0) return null
   const out: MarginTotals = {
     marginBal: 0,
@@ -1186,6 +1233,19 @@ function marginTotalsOf(data: Map<string, MarginSrc>): MarginTotals | null {
   return out
 }
 
+/** Whole-market aggregates from the primitive per-date tables. TotalAmount is
+ *  WITH TDR/ETF; StockTotalAmount excludes them. */
+export interface MarketAggregates {
+  twseMarketCapNtd?: number | null
+  twseTotalAmountNtd?: number | null
+  twseStockTotalAmountNtd?: number | null
+  twseCreditAmountNtd?: number | null
+  tpexMarketCapNtd?: number | null
+  tpexTotalAmountNtd?: number | null
+  tpexStockTotalAmountNtd?: number | null
+  tpexCreditAmountNtd?: number | null
+}
+
 /**
  * Builds the market-context object (`market-latest.json`, its OWN product —
  * never part of the stock grid). `credit` needs the per-date TWSE summary to
@@ -1205,7 +1265,8 @@ export function buildMarketContext(
   /** Markets whose daily payload was carried: their rows are the PRIOR
    *  session's, so they must not enter this session's financed value, market
    *  cap or ratio. */
-  staleMarkets: readonly ('TWSE' | 'TPEX')[] = []
+  staleMarkets: readonly ('TWSE' | 'TPEX')[] = [],
+  aggregates: MarketAggregates | null = null
 ): MarketContext | null {
   let credit: MarketCredit | null = null
   if (summary && summary.dateMs === sessionDate) {
@@ -1225,10 +1286,42 @@ export function buildMarketContext(
         : 'TWSE'
     const financed = scope === 'TWSE+TPEX' ? twse.financedNtd + tpex.financedNtd : twse.financedNtd
     const loan = scope === 'TWSE+TPEX' ? (loanTwse ?? 0) + (loanTpex ?? 0) : loanTwse
-    // The market cap denominator uses the SAME row universe as `financed`:
-    // the grid's rows for both markets. The OTC dashboard's whole-market cap
-    // (which includes funds) is carried separately and is not mixed in.
-    const cap = scope === 'TWSE+TPEX' ? twse.marketCapNtd + tpex.marketCapNtd : twse.marketCapNtd
+    // Aggregate caps come from the primitive whole-market sources (TWSE
+    // MI_QFIIS × MI_INDEX closes; TPEx highlight). Without them, the snapshot
+    // rows remain the legacy fallback for the current ETL.
+    const fallbackCap =
+      scope === 'TWSE+TPEX'
+        ? twse.hasMarketCap && tpex.hasMarketCap
+          ? twse.marketCapNtd + tpex.marketCapNtd
+          : null
+        : twse.hasMarketCap
+          ? twse.marketCapNtd
+          : null
+    // Never publish a HALF-market denominator: when either aggregate cap is
+    // missing, use the row-derived fallback for BOTH markets instead of
+    // combining one primitive with one snapshot half.
+    const positive = (v: number | null | undefined): number | null =>
+      typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null
+    const twseCap = positive(aggregates?.twseMarketCapNtd)
+    const tpexCap = positive(aggregates?.tpexMarketCapNtd ?? tpexCurrent?.marketCapNtd)
+    const twseAggCap = positive(aggregates?.twseMarketCapNtd)
+    const tpexAggCap = positive(aggregates?.tpexMarketCapNtd)
+    const cap =
+      aggregates === null
+        ? fallbackCap
+        : twseAggCap !== null && tpexAggCap !== null
+          ? twseAggCap + tpexAggCap
+          : scope === 'TWSE+TPEX'
+            ? fallbackCap
+            : (twseAggCap ?? fallbackCap)
+    const twseTotal = positive(aggregates?.twseTotalAmountNtd)
+    const tpexTotal = positive(aggregates?.tpexTotalAmountNtd)
+    const twseStockTotal = positive(aggregates?.twseStockTotalAmountNtd)
+    const tpexStockTotal = positive(aggregates?.tpexStockTotalAmountNtd)
+    const twseCredit = aggregates?.twseCreditAmountNtd ?? maintenance?.creditAmountNtd ?? null
+    const tpexCredit = aggregates?.tpexCreditAmountNtd ?? tpexCurrent?.creditAmountNtd ?? null
+    const sumBoth = (a: number | null, b: number | null): number | null =>
+      a !== null && b !== null ? a + b : null
     credit = {
       scope,
       sessionDate,
@@ -1272,13 +1365,27 @@ export function buildMarketContext(
       tpexShortPrevLots: tpexTotals ? tpexTotals.shortPrev : null,
       tpexShortChangeLots: tpexTotals ? tpexTotals.shortBal - tpexTotals.shortPrev : null,
       tpexMarginBalanceNtd: loanTpex,
-      tpexCreditAmountNtd: tpexCurrent?.creditAmountNtd ?? null,
-      tpexMarketCapNtd: tpexCurrent?.marketCapNtd ?? null,
+      tpexMarginBuyNtd: tpexCurrent?.marginBuyNtd ?? null,
+      tpexMarginSellNtd: tpexCurrent?.marginSellNtd ?? null,
+      tpexMarginCashRepayNtd: tpexCurrent?.marginCashRepayNtd ?? null,
+      tpexMarginPrevNtd: tpexCurrent?.marginPrevNtd ?? null,
+      tpexCreditAmountNtd: tpexCredit,
+      tpexMarketCapNtd: tpexCap,
+      twseMarketCapNtd: twseCap,
+      twseTotalAmountNtd: twseTotal,
+      twseStockTotalAmountNtd: twseStockTotal,
+      twseCreditAmountNtd: twseCredit,
+      tpexTotalAmountNtd: tpexTotal,
+      tpexStockTotalAmountNtd: tpexStockTotal,
+      totalAmountNtd: sumBoth(twseTotal, tpexTotal),
+      stockTotalAmountNtd: sumBoth(twseStockTotal, tpexStockTotal),
+      creditAmountNtd: sumBoth(twseCredit, tpexCredit),
       // A value the panel divides by: never 0 for a missing half.
       financedValueNtd: financed > 0 ? financed : null,
       loanBalanceNtd: loan !== null && loan > 0 ? loan : null,
-      marketCapNtd: cap > 0 ? cap : null,
-      marginToMarketCap: loan !== null && loan > 0 && cap > 0 ? (loan / cap) * 100 : null,
+      marketCapNtd: cap !== null && cap > 0 ? cap : null,
+      marginToMarketCap:
+        loan !== null && loan > 0 && cap !== null && cap > 0 ? (loan / cap) * 100 : null,
       maintenanceRatio: loan !== null && loan > 0 && financed > 0 ? (financed / loan) * 100 : null,
       maintenanceRatioKind: 'estimate',
       maintenanceRatioNote: scope === 'TWSE+TPEX' ? MAINTENANCE_NOTE : MAINTENANCE_NOTE_TWSE,
@@ -1370,14 +1477,6 @@ export interface Seed {
 /** One seed's result: a built row, or a failure that degrades to a carry. */
 type SeedOutcome =
   { ok: true; row: ScreenerRow; historyLast: string | null } | { ok: false; seed: Seed }
-
-/** One extra read when the archive answered empty (an edge miss). */
-async function dayTradeRetry<T>(read: () => Promise<T | null>): Promise<T | null> {
-  const first = await read()
-  if (first !== null) return first
-  await delay(2_000)
-  return read()
-}
 
 /** A source read with the run's TWO absence kinds separated:
  *  - a CLEAN `null` = "not published for this session yet" → `late` (the later
@@ -1943,7 +2042,7 @@ function appendSession(
         : null,
     foreignShares: finiteOrNull(seed.foreign?.shares),
     foreignRatio: finiteOrNull(seed.foreign?.ratio),
-    dayTradeShares: finiteOrNull(seed.dayTrade)
+    dayTradeShares: validDayTradeShares(seed)
   }
 
   return mergeSession(h, stamp, values, stats)
@@ -2245,12 +2344,19 @@ export function buildRow(seed: Seed, h: ScreenerHistory, stamp: string): Screene
   v[SC.ret60d] = returnOver(h.close, 60)
   v[SC.ret240d] = returnOver(h.close, 240)
   v[SC.foreignRatio] = finiteOrNull(seed.foreign?.ratio) ?? carried('foreignRatio')
-  const dayTradeShares = finiteOrNull(seed.dayTrade) ?? carried('dayTradeShares')
+  const dayTradeShares = validDayTradeShares(seed) ?? carried('dayTradeShares')
   const sessionVolume = finiteOrNull(seed.daily.volume)
-  v[SC.dayTradeRatio] =
-    dayTradeShares !== null && sessionVolume !== null && sessionVolume > 0
-      ? (dayTradeShares / sessionVolume) * 100
-      : null
+  const dayTradeValid =
+    dayTradeShares !== null &&
+    sessionVolume !== null &&
+    sessionVolume > 0 &&
+    dayTradeShares <= sessionVolume
+  if (dayTradeShares !== null && sessionVolume !== null && dayTradeShares > sessionVolume) {
+    console.log(
+      `[etl] ${seed.symbol} carried dayTrade ${dayTradeShares} > session volume ${sessionVolume} — ignored`
+    )
+  }
+  v[SC.dayTradeRatio] = dayTradeValid ? (dayTradeShares / sessionVolume) * 100 : null
   v[SC.bigHolderPct] = seed.bigHolder
   v[SC.retailPct] = seed.retail
   v[SC.holderCount] = seed.holders
@@ -2273,6 +2379,21 @@ export function buildRow(seed: Seed, h: ScreenerHistory, stamp: string): Screene
 
 function finiteOrNull(v: number | undefined | null): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null
+}
+
+/** 當沖成交股數 is a subset of the session's 成交股數. A larger value is a
+ *  source/column error; ignore it rather than publish an impossible >100%. */
+function validDayTradeShares(seed: Seed): number | null {
+  const shares = finiteOrNull(seed.dayTrade)
+  if (shares === null) return null
+  const volume = finiteOrNull(seed.daily.volume)
+  if (volume !== null && volume > 0 && shares > volume) {
+    console.log(
+      `[etl] ${seed.symbol} dayTrade ${shares} > session volume ${volume} — invalid; ignored`
+    )
+    return null
+  }
+  return shares
 }
 
 function median(values: number[]): number | null {

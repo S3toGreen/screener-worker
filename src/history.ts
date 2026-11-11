@@ -65,6 +65,7 @@ interface RwdTable {
   date?: string
   fields?: string[]
   data?: unknown[][]
+  summary?: unknown[][]
 }
 
 interface RwdPayload {
@@ -127,23 +128,94 @@ function signedChange(signCell: string, delta: number): number {
   return NaN
 }
 
-export async function twseDayBars(
+export interface TwseBreadth {
+  advancers: number | null
+  limitUp: number | null
+  decliners: number | null
+  limitDown: number | null
+  unchanged: number | null
+  noTrade: number | null
+  noQuote: number | null
+}
+
+export interface TwseMarketDay {
+  bars: Map<string, DayBar>
+  /** WITH TDR + ETF: MI_INDEX categories 1,2,4,6,14,15. */
+  totalAmountNtd: number | null
+  /** WITHOUT TDR + ETF: MI_INDEX categories 1,6,14,15. */
+  stockTotalAmountNtd: number | null
+  /** The stats table had rows but a required category was missing. */
+  totalsIncomplete: boolean
+  breadth: TwseBreadth | null
+}
+
+const TWSE_TOTAL_CATEGORIES = new Set(['1', '2', '4', '6', '14', '15'])
+const TWSE_STOCK_CATEGORIES = new Set(['1', '6', '14', '15'])
+
+/** `526(30)` → 526 with 30 limit-up/limit-down. */
+function countWithLimit(raw: string): { count: number | null; limit: number | null } {
+  const m = /^([\d,]+)(?:\s*\(([\d,]+)\))?/.exec(raw.trim())
+  if (!m) return { count: null, limit: null }
+  const count = num(m[1].replace(/,/g, ''))
+  const limit = m[2] ? num(m[2].replace(/,/g, '')) : null
+  return {
+    count: Number.isFinite(count) ? count : null,
+    limit: Number.isFinite(limit) ? limit : null
+  }
+}
+
+/** ONE TWSE `MI_INDEX` response: the daily quote table AND the market-wide
+ *  transaction summary + breadth tables. The caller already needs this request
+ *  for the bars, so totals cost no extra endpoint. */
+/** Per-run request memo: the anchor probe and the market-context wave both
+ *  need the SAME `MI_INDEX` payload. Cache only successful, default-fetch
+ *  reads (a fake fetch in tests stays isolated; a null/throw is retried).
+ *  The ETL is one short-lived process, so this cannot serve a stale session
+ *  across runs. */
+const twseMarketCache = new Map<string, Promise<TwseMarketDay | null>>()
+
+export async function twseDayMarket(
   dateMs: number,
   fetchImpl?: FetchLike
-): Promise<Map<string, DayBar> | null> {
+): Promise<TwseMarketDay | null> {
+  const stamp = dayStampOf(dateMs)
+  if (fetchImpl) return readTwseDayMarket(dateMs, fetchImpl)
+  const cached = twseMarketCache.get(stamp)
+  if (cached) return cached
+  const pending = readTwseDayMarket(dateMs)
+  twseMarketCache.set(stamp, pending)
+  if (twseMarketCache.size > 8) {
+    const oldest = twseMarketCache.keys().next().value
+    if (oldest !== undefined && oldest !== stamp) twseMarketCache.delete(oldest)
+  }
+  try {
+    const value = await pending
+    if (!value) twseMarketCache.delete(stamp)
+    return value
+  } catch (err) {
+    twseMarketCache.delete(stamp)
+    throw err
+  }
+}
+
+async function readTwseDayMarket(
+  dateMs: number,
+  fetchImpl?: FetchLike
+): Promise<TwseMarketDay | null> {
   const stamp = dayStampOf(dateMs)
   const url = `${TWSE_RWD}/afterTrading/MI_INDEX?date=${stamp}&type=ALLBUT0999&response=json`
   const payload = (await getJson(url, fetchImpl, SLOW_MS)) as RwdPayload | null
-  const table = (payload?.tables ?? []).find((t) => t.fields?.includes('證券代號'))
-  if (!table?.data || !table.fields || !titleIsSession(table.title, stamp)) return null
-  const at = indexer(table.fields)
-  const out = new Map<string, DayBar>()
-  for (const row of table.data) {
+  const tables = payload?.tables ?? []
+  const quote = tables.find((t) => t.fields?.includes('證券代號'))
+  if (!quote?.data || !quote.fields || !titleIsSession(quote.title, stamp)) return null
+  const at = indexer(quote.fields)
+  const bars = new Map<string, DayBar>()
+  for (const row of quote.data) {
     const symbol = cell(row, at, '證券代號').trim()
     if (!isScreenerSymbol(symbol)) continue
     const close = rawPrice(cell(row, at, '收盤價'))
     if (!Number.isFinite(close) || close <= 0) continue
-    out.set(symbol, {
+    bars.set(symbol, {
       name: cell(row, at, '證券名稱').trim(),
       open: rawPrice(cell(row, at, '開盤價')),
       high: rawPrice(cell(row, at, '最高價')),
@@ -156,7 +228,67 @@ export async function twseDayBars(
       shares: 0
     })
   }
-  return out
+
+  const stats = tables.find((t) => t.fields?.includes('成交統計'))
+  let totalAmountNtd: number | null = null
+  let stockTotalAmountNtd: number | null = null
+  let totalsIncomplete = false
+  if (stats?.fields && stats.data) {
+    const sat = indexer(stats.fields)
+    let total = 0
+    let stock = 0
+    const seen = new Set<string>()
+    for (const row of stats.data) {
+      const label = String(row[sat('成交統計')] ?? '').trim()
+      const category = /^(\d+)\./.exec(label)?.[1]
+      if (!category) continue
+      const amount = num(String(row[sat('成交金額(元)')] ?? '').replace(/,/g, ''))
+      if (!Number.isFinite(amount)) continue
+      seen.add(category)
+      if (TWSE_TOTAL_CATEGORIES.has(category)) total += amount
+      if (TWSE_STOCK_CATEGORIES.has(category)) stock += amount
+    }
+    // A missing category means a truncated table, not a zero contribution.
+    const totalComplete = [...TWSE_TOTAL_CATEGORIES].every((c) => seen.has(c))
+    const stockComplete = [...TWSE_STOCK_CATEGORIES].every((c) => seen.has(c))
+    totalsIncomplete = stats.data.length > 0 && (!totalComplete || !stockComplete)
+    totalAmountNtd = totalComplete && total > 0 ? total : null
+    stockTotalAmountNtd = stockComplete && stock > 0 ? stock : null
+  }
+
+  const breadthTable = tables.find(
+    (t) => (t.fields ?? []).includes('類型') && (t.fields ?? []).includes('股票')
+  )
+  let breadth: TwseBreadth | null = null
+  if (breadthTable?.fields && breadthTable.data) {
+    const bat = indexer(breadthTable.fields)
+    const pick = (label: string): string => {
+      const row = breadthTable.data?.find((r) => String(r[bat('類型')] ?? '').trim() === label)
+      return row ? String(row[bat('股票')] ?? '').trim() : ''
+    }
+    const up = countWithLimit(pick('上漲(漲停)'))
+    const down = countWithLimit(pick('下跌(跌停)'))
+    const unchanged = num(pick('持平').replace(/,/g, ''))
+    const noTrade = num(pick('未成交').replace(/,/g, ''))
+    const noQuote = num(pick('無比價').replace(/,/g, ''))
+    breadth = {
+      advancers: up.count,
+      limitUp: up.limit,
+      decliners: down.count,
+      limitDown: down.limit,
+      unchanged: Number.isFinite(unchanged) ? unchanged : null,
+      noTrade: Number.isFinite(noTrade) ? noTrade : null,
+      noQuote: Number.isFinite(noQuote) ? noQuote : null
+    }
+  }
+  return { bars, totalAmountNtd, stockTotalAmountNtd, totalsIncomplete, breadth }
+}
+
+export async function twseDayBars(
+  dateMs: number,
+  fetchImpl?: FetchLike
+): Promise<Map<string, DayBar> | null> {
+  return (await twseDayMarket(dateMs, fetchImpl))?.bars ?? null
 }
 
 /**
@@ -387,10 +519,69 @@ export async function twseMarginDay(
  * market OTC totals are summed from this map, so a stock-only filter would
  * silently undercount them (the seeds still look up stocks only).
  */
-export async function tpexDayMargin(
+export interface TpexMarginSummary {
+  marginPrevLots: number | null
+  marginBuyLots: number | null
+  marginSellLots: number | null
+  marginCashRepayLots: number | null
+  marginBalanceLots: number | null
+  shortPrevLots: number | null
+  shortSellLots: number | null
+  shortCoverLots: number | null
+  shortCashRepayLots: number | null
+  shortBalanceLots: number | null
+  marginPrevNtd: number | null
+  marginBuyNtd: number | null
+  marginSellNtd: number | null
+  marginCashRepayNtd: number | null
+  marginBalanceNtd: number | null
+}
+
+export interface TpexMarginDay {
+  stocks: Map<string, MarginSrc>
+  summary: TpexMarginSummary | null
+}
+
+/**
+ * ONE TPEx `margin/balance` response. The per-stock `data` and the market
+ * `summary` cost the same request. The summary carries TWO rows:
+ *   合計(張)          — lots, in the same column order as `fields`
+ *   融資金(仟元)      — margin loan flows/balance, ×1000 for NT$
+ * The `data` table includes every security (ETFs included); the summary is the
+ * authoritative whole-market row.
+ */
+/** Per-run request memo for the same reason as `twseDayMarket`: the per-stock
+ *  margin read and the market-summary read are ONE `margin/balance` payload. */
+const tpexMarginCache = new Map<string, Promise<TpexMarginDay | null>>()
+
+export async function tpexDayMarginFull(
   dateMs: number,
   fetchImpl?: FetchLike
-): Promise<Map<string, MarginSrc> | null> {
+): Promise<TpexMarginDay | null> {
+  const stamp = dayStampOf(dateMs)
+  if (fetchImpl) return readTpexDayMarginFull(dateMs, fetchImpl)
+  const cached = tpexMarginCache.get(stamp)
+  if (cached) return cached
+  const pending = readTpexDayMarginFull(dateMs)
+  tpexMarginCache.set(stamp, pending)
+  if (tpexMarginCache.size > 8) {
+    const oldest = tpexMarginCache.keys().next().value
+    if (oldest !== undefined && oldest !== stamp) tpexMarginCache.delete(oldest)
+  }
+  try {
+    const value = await pending
+    if (!value) tpexMarginCache.delete(stamp)
+    return value
+  } catch (err) {
+    tpexMarginCache.delete(stamp)
+    throw err
+  }
+}
+
+async function readTpexDayMarginFull(
+  dateMs: number,
+  fetchImpl?: FetchLike
+): Promise<TpexMarginDay | null> {
   const stamp = dayStampOf(dateMs)
   const url =
     `${TPEX_RWD}/margin/balance?` +
@@ -400,19 +591,16 @@ export async function tpexDayMargin(
   const table = (payload.tables ?? [])[0]
   if (!table?.data || !table.fields || !payloadIsSession(table.date, payload.date, stamp))
     return null
-  const out = new Map<string, MarginSrc>()
+  const stocks = new Map<string, MarginSrc>()
   for (const row of table.data) {
     const symbol = String(row[0] ?? '').trim()
-    // EVERY security (ETFs included): the market-wide totals are summed from
-    // this map, so a stock-only filter would silently undercount them. The
-    // seeds still look rows up by their own stock symbols only.
     if (!symbol) continue
     const n = (pos: number): number => num(String(row[pos] ?? ''))
     const today = n(6)
     if (!Number.isFinite(today)) continue
     const shortToday = n(14)
     if (!Number.isFinite(shortToday)) continue
-    out.set(symbol, {
+    stocks.set(symbol, {
       marginBal: today,
       quota: n(9),
       shortBal: shortToday,
@@ -429,7 +617,158 @@ export async function tpexDayMargin(
       note: String(row[19] ?? '').trim()
     })
   }
-  return out.size > 0 ? out : null
+
+  const rows = table.summary
+  const summaryRow = (needle: string): unknown[] | null => {
+    if (!Array.isArray(rows)) return null
+    for (const row of rows) {
+      if (Array.isArray(row) && String(row[1] ?? '').includes(needle)) return row
+    }
+    return null
+  }
+  const lot = summaryRow('合計(張)')
+  const money = summaryRow('融資金(仟元)')
+  const lotVal = (row: unknown[] | null, index: number): number | null => {
+    const value = num(String(row?.[index] ?? '').replace(/,/g, ''))
+    return Number.isFinite(value) ? value : null
+  }
+  const moneyVal = (row: unknown[] | null, index: number): number | null => {
+    const value = lotVal(row, index)
+    return value === null ? null : value * 1000
+  }
+  const summary: TpexMarginSummary | null = lot
+    ? {
+        marginPrevLots: lotVal(lot, 2),
+        marginBuyLots: lotVal(lot, 3),
+        marginSellLots: lotVal(lot, 4),
+        marginCashRepayLots: lotVal(lot, 5),
+        marginBalanceLots: lotVal(lot, 6),
+        shortPrevLots: lotVal(lot, 10),
+        shortSellLots: lotVal(lot, 11),
+        shortCoverLots: lotVal(lot, 12),
+        shortCashRepayLots: lotVal(lot, 13),
+        shortBalanceLots: lotVal(lot, 14),
+        marginPrevNtd: moneyVal(money, 2),
+        marginBuyNtd: moneyVal(money, 3),
+        marginSellNtd: moneyVal(money, 4),
+        marginCashRepayNtd: moneyVal(money, 5),
+        marginBalanceNtd: moneyVal(money, 6)
+      }
+    : null
+  return stocks.size > 0 || summary ? { stocks, summary } : null
+}
+
+/** The map-only view used by the per-symbol backfill. */
+export async function tpexDayMargin(
+  dateMs: number,
+  fetchImpl?: FetchLike
+): Promise<Map<string, MarginSrc> | null> {
+  const day = await tpexDayMarginFull(dateMs, fetchImpl)
+  return day?.stocks && day.stocks.size > 0 ? day.stocks : null
+}
+
+/** TPEx `afterTrading/marketStats` — the primitive category totals. */
+export interface TpexMarketStats {
+  dateMs: number
+  /** WITH TDR + ETF: categories 1,2,3,5,6. */
+  totalAmountNtd: number | null
+  /** WITHOUT TDR + ETF: categories 1,2,3. */
+  stockTotalAmountNtd: number | null
+  /** The stats table had rows but a required category was missing. */
+  totalsIncomplete: boolean
+}
+
+const TPEX_TOTAL_CATEGORIES = new Set(['1', '2', '3', '5', '6'])
+const TPEX_STOCK_CATEGORIES = new Set(['1', '2', '3'])
+
+export async function tpexDayMarketStats(
+  dateMs: number,
+  fetchImpl?: FetchLike
+): Promise<TpexMarketStats | null> {
+  const stamp = dayStampOf(dateMs)
+  const url =
+    `${TPEX_RWD}/afterTrading/marketStats?type=Daily&` +
+    `date=${stamp.slice(0, 4)}/${stamp.slice(4, 6)}/${stamp.slice(6, 8)}&response=json`
+  const payload = (await getJson(url, fetchImpl, SLOW_MS)) as RwdPayload | null
+  if (payload?.stat !== 'ok') return null
+  const table = (payload.tables ?? [])[0]
+  if (!table?.data || !table.fields || !payloadIsSession(table.date, payload.date, stamp))
+    return null
+  const at = indexer(table.fields)
+  let total = 0
+  let stock = 0
+  const seen = new Set<string>()
+  for (const row of table.data) {
+    const label = String(row[at('成交統計')] ?? '').trim()
+    const category = /^(\d+)\./.exec(label)?.[1]
+    if (!category) continue
+    const amount = num(String(row[at('成交金額(元)')] ?? '').replace(/,/g, ''))
+    if (!Number.isFinite(amount)) continue
+    seen.add(category)
+    if (TPEX_TOTAL_CATEGORIES.has(category)) total += amount
+    if (TPEX_STOCK_CATEGORIES.has(category)) stock += amount
+  }
+  const totalComplete = [...TPEX_TOTAL_CATEGORIES].every((c) => seen.has(c))
+  const stockComplete = [...TPEX_STOCK_CATEGORIES].every((c) => seen.has(c))
+  return {
+    dateMs,
+    totalAmountNtd: totalComplete && total > 0 ? total : null,
+    stockTotalAmountNtd: stockComplete && stock > 0 ? stock : null,
+    totalsIncomplete: table.data.length > 0 && (!totalComplete || !stockComplete)
+  }
+}
+
+/** TPEx `afterTrading/highlight` — the one-row whole-market cap + breadth. */
+export interface TpexHighlight {
+  dateMs: number
+  marketCapNtd: number | null
+  totalAmountNtd: number | null
+  advancers: number | null
+  limitUp: number | null
+  decliners: number | null
+  limitDown: number | null
+  unchanged: number | null
+  noTrade: number | null
+}
+
+export async function tpexDayHighlight(
+  dateMs: number,
+  fetchImpl?: FetchLike
+): Promise<TpexHighlight | null> {
+  const stamp = dayStampOf(dateMs)
+  const day = `${stamp.slice(0, 4)}/${stamp.slice(4, 6)}/${stamp.slice(6, 8)}`
+  const payload = (await getJson(
+    `${TPEX_RWD}/afterTrading/highlight?date=${day}&response=json`,
+    fetchImpl,
+    SLOW_MS
+  )) as RwdPayload | null
+  if (payload?.stat !== 'ok') return null
+  const table = (payload.tables ?? [])[0]
+  if (!table?.fields || !table.data?.[0] || !payloadIsSession(table.date, payload.date, stamp))
+    return null
+  const at = indexer(table.fields)
+  const row = table.data[0]
+  const n = (field: string): number | null => {
+    const value = num(String(row[at(field)] ?? '').replace(/,/g, ''))
+    return Number.isFinite(value) ? value : null
+  }
+  const yi = (field: string): number | null => {
+    const value = n(field)
+    return value === null ? null : value * 1_000_000
+  }
+  const marketCap = yi('總市值(佰萬元)')
+  const totalAmount = yi('本日總成交值(佰萬元)')
+  return {
+    dateMs,
+    marketCapNtd: marketCap !== null && marketCap > 0 ? marketCap : null,
+    totalAmountNtd: totalAmount !== null && totalAmount > 0 ? totalAmount : null,
+    advancers: n('上漲家數'),
+    limitUp: n('漲停家數'),
+    decliners: n('下跌家數'),
+    limitDown: n('跌停家數'),
+    unchanged: n('平盤家數'),
+    noTrade: n('未成交(含暫停交易)家數')
+  }
 }
 
 /**
@@ -452,7 +791,7 @@ export async function tpexDayTrade(
   if (!stamp) return null
   const day = `${stamp.slice(0, 4)}/${stamp.slice(4, 6)}/${stamp.slice(6, 8)}`
   const payload = (await getJson(
-    `${TPEX_RWD}/intraday/stat?date=${day}&type=Daily&response=json`,
+    `${TPEX_RWD}/intraday/stat?type=Daily&date=${day}&response=json`,
     fetchImpl,
     SLOW_MS
   )) as RwdPayload | null
@@ -460,6 +799,7 @@ export async function tpexDayTrade(
   const table = (payload.tables ?? []).find((t) => t.fields?.some((f) => f.trim() === '證券代號'))
   if (!table?.fields || !table.data || table.data.length === 0) return null
   const at = indexer(table.fields)
+  if (!table.fields.some((f) => f.trim() === '當日沖銷交易成交股數')) return null
   const out = new Map<string, number>()
   let sum = 0
   for (const row of table.data) {
@@ -531,6 +871,7 @@ export async function twseDayForeign(
   if (!payloadIsSession(table.date, payload.date, stamp)) return null
   const sharesAt = table.fields.findIndex((f) => f.includes('持有股數'))
   const ratioAt = table.fields.findIndex((f) => f.includes('持股比率'))
+  const issuedAt = table.fields.findIndex((f) => f.includes('發行股數'))
   if (sharesAt < 0 || ratioAt < 0) return null
   const at = indexer(table.fields)
   const out = new Map<string, ForeignHold>()
@@ -539,10 +880,41 @@ export async function twseDayForeign(
     if (!isScreenerSymbol(symbol)) continue
     out.set(symbol, {
       shares: num(valueAt(row, sharesAt)),
-      ratio: num(valueAt(row, ratioAt))
+      ratio: num(valueAt(row, ratioAt)),
+      ...(issuedAt >= 0 ? { issuedShares: num(valueAt(row, issuedAt)) } : {})
     })
   }
   return out.size > 0 ? out : null
+}
+
+/** Stock-only TWSE cap: MI_QFIIS issued shares × MI_INDEX close. TDR/ETF are
+ *  deliberately excluded from the stock-only series. */
+export function twseStockMarketCap(
+  foreign: Map<string, ForeignHold> | null,
+  bars: Map<string, DayBar> | null,
+  /** Minimum share of the 4-digit stocks in `bars` that must have a finite
+   *  issued-share/close pair. A truncated MI_QFIIS page otherwise yields a
+   *  plausible but tiny cap (and an inflated margin/cap ratio). */
+  minCoverage = 0
+): number | null {
+  if (!foreign || !bars) return null
+  let total = 0
+  let stockBars = 0
+  let covered = 0
+  for (const [symbol, bar] of bars) {
+    // Ordinary 4-digit stock codes; TDRs (91xxxx) and funds (0xxxx) are not
+    // in this series.
+    if (!/^[1-9][0-9]{3}$/.test(symbol)) continue
+    stockBars++
+    const shares = foreign.get(symbol)?.issuedShares
+    const close = bar.close
+    if (!Number.isFinite(shares) || !Number.isFinite(close)) continue
+    total += ((shares as number) * (close as number)) / 100
+    covered++
+  }
+  if (stockBars === 0 || covered === 0) return null
+  if (covered < Math.ceil(stockBars * Math.max(0, minCoverage))) return null
+  return total > 0 ? total : null
 }
 
 /**

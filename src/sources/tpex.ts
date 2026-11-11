@@ -290,15 +290,23 @@ export async function tpexCreditSummary(
   } | null
   if (!payload || payload.stat !== 'ok' || payload.hasMarginData === false) return null
   if (payload.date !== undefined && payload.date !== stamp) return null
-  const n = (v: unknown): number => (typeof v === 'number' ? v : num(String(v ?? '')))
-  const marginBalanceNtd = n(payload.marginBalance) * YI
-  const marketCapNtd = n(payload.marketCap) * YI
-  if (!Number.isFinite(marginBalanceNtd) || !Number.isFinite(marketCapNtd)) return null
+  const n = (v: unknown): number | null => {
+    const value = typeof v === 'number' ? v : num(String(v ?? ''))
+    return Number.isFinite(value) ? value : null
+  }
+  // The credit amount is the one field this dashboard is used for. The other
+  // cells are a legacy fallback; an absent margin/cap cell must not discard a
+  // real creditAmount.
+  const credit = n(payload.creditAmount)
+  if (credit === null) return null
+  const margin = n(payload.marginBalance)
+  const cap = n(payload.marketCap)
+  const short = n(payload.shortBalance)
   return {
     dateMs,
-    marginBalanceNtd,
-    marketCapNtd,
-    shortBalanceLots: n(payload.shortBalance),
-    creditAmountNtd: n(payload.creditAmount) * YI
+    marginBalanceNtd: margin === null ? null : margin * YI,
+    marketCapNtd: cap === null ? null : cap * YI,
+    shortBalanceLots: short,
+    creditAmountNtd: credit * YI
   }
 }

@@ -761,13 +761,27 @@ describe('buildRow — a same-stamp re-run keeps the KNOWN cells', () => {
 
   test("a NEW session never borrows the previous session's cells", () => {
     const h = emptyHistory()
-    mergeSession(h, '20261103', values({ per: 26.2, marginBal: 35_144 }), { preserved: 0 })
+    mergeSession(
+      h,
+      '20261103',
+      values({ per: 26.2, marginBal: 35_144, dayTradeShares: 11_008_000 }),
+      { preserved: 0 }
+    )
     const row = buildRow(seed(), h, '20261104')
     expect(row[SC.per]).toBeNull()
     expect(row[SC.marginBal]).toBeNull()
+    expect(row[SC.dayTradeRatio]).toBeNull()
     // The price-derived values still come from THIS session's daily.
     expect(row[SC.close]).toBe(226_000)
     expect(row[SC.marketCap]).toBeCloseTo((2_593_000_000_000 / 1000) * 2260, 0)
+  })
+
+  test('a day-trade value above the session volume is ignored, never >100%', () => {
+    const h = emptyHistory()
+    const s = seed()
+    s.dayTrade = 60_000_000
+    const row = buildRow(s, h, '20261104')
+    expect(row[SC.dayTradeRatio]).toBeNull()
   })
 })
 

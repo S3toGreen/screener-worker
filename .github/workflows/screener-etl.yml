@@ -101,9 +101,10 @@ jobs:
         run: |
           set +e
           force=''
-          # The 03:45 Taipei guard is ALWAYS a forced same-session rewrite.
-          # GitHub emits the UTC cron: 19:45 UTC, Mon–Fri.
-          if [ "${{ inputs.force }}" = 'true' ] || [ "${{ github.event.schedule }}" = '45 19 * * 1-5' ]; then
+          # The 21:15 evening pass and the 03:45 guard are forced same-session
+          # rewrites: a late 當沖/margin/SBL table must actually be repaired,
+          # not skipped by the freshness gate. GitHub emits the UTC crons.
+          if [ "${{ inputs.force }}" = 'true' ] || [ "${{ github.event.schedule }}" = '45 19 * * 1-5' ] || [ "${{ github.event.schedule }}" = '15 13 * * 1-5' ]; then
             force='--force'
           fi
           # A safety repair changed a history. Rebuild the snapshot even on holidays.

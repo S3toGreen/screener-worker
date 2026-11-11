@@ -120,6 +120,8 @@ export interface MaintenancePoint {
   dateMs: number
   /** `keepRate` — percent (e.g. 182.63). */
   keepRate: number
+  /** `crdAmt` — the session's credit transaction amount (NT$). */
+  creditAmountNtd?: number | null
 }
 
 /** The market-wide 信用交易 aggregate (TWSE's own 信用交易統計 table). Lots
@@ -148,13 +150,20 @@ export interface CreditSummary {
 export interface TpexCreditSummary {
   dateMs: number
   /** 融資餘額 (NT$) — the announced OTC loan balance. */
-  marginBalanceNtd: number
+  marginBalanceNtd: number | null
   /** 融券餘額 (交易單位). */
-  shortBalanceLots: number
+  shortBalanceLots: number | null
   /** 信用交易成交金額 (NT$). */
-  creditAmountNtd: number
+  creditAmountNtd: number | null
   /** 上櫃市場總市值 (NT$). */
-  marketCapNtd: number
+  marketCapNtd: number | null
+  /** `margin/balance` summary `融資金(仟元)` flow columns (NT$). */
+  marginPrevNtd?: number | null
+  marginBuyNtd?: number | null
+  marginSellNtd?: number | null
+  marginCashRepayNtd?: number | null
+  /** `marketStats` category total (NT$) — optional on the legacy dashboard. */
+  totalAmountNtd?: number | null
 }
 
 export interface SblSrc {
@@ -166,6 +175,8 @@ export interface SblSrc {
 export interface ForeignHold {
   shares: number
   ratio: number
+  /** Issued shares from MI_QFIIS (TWSE only). */
+  issuedShares?: number
 }
 
 /** Institutional net flow in SHARES (the pipeline converts to NT$ with the

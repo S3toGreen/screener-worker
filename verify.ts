@@ -36,6 +36,8 @@ import {
   screenerSnapshotUrl
 } from '@odf/screener-worker/screener'
 import { SCREENER_CDN_DEFAULT } from '@odf/screener-worker/config'
+import { tpexDayTrade } from './src/history'
+import { twseDayTrade } from './src/sources/twse'
 
 const arg = (name: string, fallback: string): string => {
   const i = process.argv.indexOf(`--${name}`)
@@ -58,6 +60,53 @@ function stampOf(ms: number): string {
 /** `20261030` → the ROC form the rwd endpoints take (`115/10/30`). */
 function rocDate(stamp: string): string {
   return `${Number(stamp.slice(0, 4)) - 1911}/${stamp.slice(4, 6)}/${stamp.slice(6)}`
+}
+
+interface DayTradeSource {
+  map: Map<string, number> | null
+  error: string
+}
+
+/** The exchange's 當沖 report is the publication gate for the ratio checks:
+ *  null = not published yet (a note, not a failure); a thrown read = a source
+ *  error worth printing. */
+async function readDayTradeSource(
+  read: () => Promise<Map<string, number> | null>
+): Promise<DayTradeSource> {
+  try {
+    return { map: await read(), error: '' }
+  } catch (err) {
+    return { map: null, error: String(err) }
+  }
+}
+
+/** The snapshot's ratio is only meaningful when the exchange report for that
+ *  session exists. A null source means the later repair will fill it; a
+ *  published source with a null/zero/out-of-range cell is a real failure. */
+function checkDayTrade(
+  label: string,
+  source: DayTradeSource,
+  value: number | null,
+  stamp: string
+): void {
+  if (source.error) {
+    console.log(`note ${label} dayTradeRatio — source read failed: ${source.error}`)
+    return
+  }
+  if (source.map === null) {
+    console.log(
+      `note ${label} dayTradeRatio — ${stamp} 當沖 report not published yet; ` +
+        'the 21:15/03:45 repair will fill it'
+    )
+    return
+  }
+  check(
+    value !== null && value > 0 && value <= 100,
+    `${label} dayTradeRatio in (0, 100]`,
+    value === null
+      ? `${stamp} source is published but the snapshot cell is null — rerun seed --force`
+      : `${value}`
+  )
 }
 
 async function getJson(url: string): Promise<unknown> {
@@ -112,12 +161,111 @@ try {
       `credit=${ctx.credit !== null} derivatives=${ctx.derivatives !== null}`
     )
     if (ctx.credit) {
+      const c = ctx.credit
+      const positive = (v: number | null | undefined): boolean =>
+        typeof v === 'number' && Number.isFinite(v) && v > 0
       check(
-        ctx.credit.twseMarginBalanceLots !== null &&
-          (ctx.credit.maintenanceRatio !== null || ctx.credit.officialMaintenanceRatio !== null),
+        c.twseMarginBalanceLots !== null &&
+          (c.maintenanceRatio !== null || c.officialMaintenanceRatio !== null),
         'credit balance present; the estimate and the official ratio are separate slots',
-        `estimate=${ctx.credit.maintenanceRatio} official=${ctx.credit.officialMaintenanceRatio} scope=${ctx.credit.scope}`
+        `estimate=${c.maintenanceRatio} official=${c.officialMaintenanceRatio} scope=${c.scope}`
       )
+      // The symmetric whole-market columns are the point of this contract:
+      // a missing half must fail, never look like a complete market.
+      check(positive(c.twseMarketCapNtd), 'TWSE market cap', `${c.twseMarketCapNtd}`)
+      check(positive(c.tpexMarketCapNtd), 'TPEx market cap', `${c.tpexMarketCapNtd}`)
+      check(positive(c.marketCapNtd), 'combined market cap', `${c.marketCapNtd}`)
+      if (
+        positive(c.twseMarketCapNtd) &&
+        positive(c.tpexMarketCapNtd) &&
+        positive(c.marketCapNtd)
+      ) {
+        check(
+          Math.abs(
+            (c.twseMarketCapNtd as number) + (c.tpexMarketCapNtd as number) - c.marketCapNtd!
+          ) < 10,
+          'combined market cap = TWSE + TPEx',
+          `${c.twseMarketCapNtd} + ${c.tpexMarketCapNtd} vs ${c.marketCapNtd}`
+        )
+      }
+      check(
+        positive(c.twseTotalAmountNtd),
+        'TWSE turnover incl. TDR/ETF',
+        `${c.twseTotalAmountNtd}`
+      )
+      check(
+        positive(c.tpexTotalAmountNtd),
+        'TPEx turnover incl. TDR/ETF',
+        `${c.tpexTotalAmountNtd}`
+      )
+      check(positive(c.totalAmountNtd), 'combined turnover incl. TDR/ETF', `${c.totalAmountNtd}`)
+      if (
+        positive(c.twseTotalAmountNtd) &&
+        positive(c.tpexTotalAmountNtd) &&
+        positive(c.totalAmountNtd)
+      ) {
+        check(
+          Math.abs(
+            (c.twseTotalAmountNtd as number) + (c.tpexTotalAmountNtd as number) - c.totalAmountNtd!
+          ) < 1,
+          'combined turnover = TWSE + TPEx',
+          `${c.twseTotalAmountNtd} + ${c.tpexTotalAmountNtd} vs ${c.totalAmountNtd}`
+        )
+      }
+      check(
+        positive(c.twseStockTotalAmountNtd),
+        'TWSE stock-only turnover',
+        `${c.twseStockTotalAmountNtd}`
+      )
+      check(
+        positive(c.tpexStockTotalAmountNtd),
+        'TPEx stock-only turnover',
+        `${c.tpexStockTotalAmountNtd}`
+      )
+      check(
+        positive(c.stockTotalAmountNtd),
+        'combined stock-only turnover',
+        `${c.stockTotalAmountNtd}`
+      )
+      if (
+        positive(c.twseStockTotalAmountNtd) &&
+        positive(c.tpexStockTotalAmountNtd) &&
+        positive(c.stockTotalAmountNtd)
+      ) {
+        check(
+          Math.abs(
+            (c.twseStockTotalAmountNtd as number) +
+              (c.tpexStockTotalAmountNtd as number) -
+              c.stockTotalAmountNtd!
+          ) < 1,
+          'combined stock-only turnover = TWSE + TPEx',
+          `${c.twseStockTotalAmountNtd} + ${c.tpexStockTotalAmountNtd} vs ${c.stockTotalAmountNtd}`
+        )
+      }
+      check(
+        positive(c.twseCreditAmountNtd),
+        'TWSE credit trading value',
+        `${c.twseCreditAmountNtd}`
+      )
+      if (positive(c.tpexCreditAmountNtd)) {
+        check(positive(c.creditAmountNtd), 'combined credit trading value', `${c.creditAmountNtd}`)
+        if (positive(c.creditAmountNtd)) {
+          check(
+            Math.abs(
+              (c.twseCreditAmountNtd as number) +
+                (c.tpexCreditAmountNtd as number) -
+                c.creditAmountNtd!
+            ) < 1,
+            'combined credit trading value = TWSE + TPEx',
+            `${c.twseCreditAmountNtd} + ${c.tpexCreditAmountNtd} vs ${c.creditAmountNtd}`
+          )
+        }
+      } else {
+        console.log(
+          'note TPEx credit trading value — the dashboard series is absent (expected before 2026-09-10); the combined cell is null'
+        )
+        check(c.creditAmountNtd === null, 'combined credit value is null without the TPEx half')
+      }
     }
     if (ctx.derivatives) {
       check(
@@ -162,13 +310,13 @@ const bySymbol = new Map(snapshot.rows.map((r) => [String(r[0]), r]))
 // The two sourced columns must be present on a TWSE row once their feeds ran:
 // 當沖 comes from the daily ETL, 千張大戶 from the weekly TDCC job (absent until
 // the first run — reported, not failed).
+const [twseDayTradeSource, tpexDayTradeSource] = await Promise.all([
+  readDayTradeSource(() => twseDayTrade(snapshot.sessionDate)),
+  readDayTradeSource(() => tpexDayTrade(snapshot.sessionDate))
+])
 const r2330 = bySymbol.get('2330')
 const dayTrade = r2330 ? screenNum(r2330, 'dayTradeRatio') : null
-check(
-  dayTrade !== null && dayTrade > 0 && dayTrade <= 100,
-  '2330 dayTradeRatio in (0, 100]',
-  `${dayTrade}`
-)
+checkDayTrade('2330', twseDayTradeSource, dayTrade, stamp)
 const retail = r2330 ? screenNum(r2330, 'retailPct') : null
 check(retail !== null && retail > 0 && retail < 100, '2330 retailPct in (0, 100)', `${retail}`)
 const cumYoy = r2330 ? screenNum(r2330, 'revenueCumYoy') : null
@@ -196,11 +344,7 @@ console.log(`${big === null ? 'note' : 'ok  '} 2330 bigHolderPct — ${big ?? 'n
 // A TPEx row carries its own 當沖 series (the OTC exchange publishes one too).
 const r6488 = bySymbol.get('6488')
 const tpDay = r6488 ? screenNum(r6488, 'dayTradeRatio') : null
-check(
-  tpDay !== null && tpDay > 0 && tpDay <= 100,
-  '6488 (TPEx) dayTradeRatio in (0, 100]',
-  `${tpDay}`
-)
+checkDayTrade('6488 (TPEx)', tpexDayTradeSource, tpDay, stamp)
 
 for (const symbol of symbols) {
   const row = bySymbol.get(symbol)

@@ -79,7 +79,7 @@ describe('the edge cache', () => {
     )
     await Promise.all(first.pending)
     expect(res.status).toBe(200)
-    expect([...cache.map.keys()]).toEqual(['https://odf-trading.pages.dev/api/snapshot?edge=12-v1'])
+    expect([...cache.map.keys()]).toEqual(['https://odf-trading.pages.dev/api/snapshot?edge=13-v1'])
     expect(reads).toEqual(['cache-version.json', 'screener-latest.json'])
 
     const second = context()
@@ -115,7 +115,7 @@ describe('the edge cache', () => {
       second
     )
     expect(res.headers.get('x-edge-cache')).toBe('miss')
-    expect([...cache.map.keys()]).toContain('https://odf-trading.pages.dev/api/snapshot?edge=12-v2')
+    expect([...cache.map.keys()]).toContain('https://odf-trading.pages.dev/api/snapshot?edge=13-v2')
   })
 
   test('history entries are NOT versioned (a publish must not evict the archive)', async () => {
@@ -130,7 +130,7 @@ describe('the edge cache', () => {
     await Promise.all(first.pending)
     expect(res.status).toBe(200)
     expect([...cache.map.keys()]).toEqual([
-      'https://odf-trading.pages.dev/api/history/2330?edge=12'
+      'https://odf-trading.pages.dev/api/history/2330?edge=13'
     ])
     // The history path never even reads the stamp object.
     expect(reads).toEqual(['history/2330.json'])

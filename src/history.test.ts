@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { stampToMs } from '@odf/screener-worker/session'
 import type { FetchLike, HttpResult } from '@odf/screener-worker/httpJson'
 import { twseDayQuotes, twseDaySblBal } from './history'
+import { twseOfficialTrend } from './sources/twse'
 
 /** A fetch double serving one fixed JSON payload. */
 function stub(payload: unknown): FetchLike {
@@ -86,5 +87,22 @@ describe('twseDayQuotes — an empty table is no session', () => {
       ]
     }
     expect(await twseDayQuotes(stampToMs('20261104'), stub(payload))).toBeNull()
+  })
+})
+
+describe('twseOfficialTrend — an empty crdAmt is absent, not zero', () => {
+  test('a blank crdAmt stays null', async () => {
+    const dateMs = stampToMs('20261110')
+    const map = await twseOfficialTrend(
+      1,
+      dateMs,
+      stub({
+        stat: 'OK',
+        date: '20261110',
+        data: [{ date: '20261110', keepRate: 180, crdAmt: '' }]
+      })
+    )
+    expect(map.get(dateMs)?.keepRate).toBe(180)
+    expect(map.get(dateMs)?.creditAmountNtd).toBeNull()
   })
 })
